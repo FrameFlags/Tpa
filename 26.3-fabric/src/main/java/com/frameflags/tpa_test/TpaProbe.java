@@ -48,6 +48,8 @@ public final class TpaProbe {
     private static Pose expiryUser;
     private static Pose expiryBot;
     private static final List<FakePlayer> BOTS = new ArrayList<>();
+    /** Players whose original gravity was disabled by the probe; restored in cleanup(). */
+    private static final List<ServerPlayer> GRAVITY_CHANGED = new ArrayList<>();
     private static final List<String> PASSED = new ArrayList<>();
     private static final List<String> FAILED = new ArrayList<>();
 
@@ -111,7 +113,7 @@ public final class TpaProbe {
         ServerPlayer real = server.getPlayerList().getPlayer(user);
         if (real == null) return;
         int elapsed = tick - startTick;
-        if (elapsed < 40) return;
+        if (elapsed < 2) return;
         if (elapsed > 2400) {
             check(false, "timeout");
             finish();
@@ -147,10 +149,11 @@ public final class TpaProbe {
         for (FakePlayer fake : BOTS) clear(fake.getUUID());
         clear(user);
 
-        int before = registrySize();
         int rc = dispatch(server, real, "tpa TpaBot0");
         check(rc > 0 && inbound(bot.getUUID()).size() == 1 && chat(user) == 1, "request_ok");
 
+        // Baseline must be taken AFTER the successful request, which stays pending.
+        int before = registrySize();
         clear(user);
         rc = dispatch(server, real, "tpa " + real.getGameProfile().name());
         check(rc == 0 && chat(user) == 1 && registrySize() == before, "self_rejected");
@@ -408,6 +411,12 @@ public final class TpaProbe {
     }
 
     private static void move(ServerPlayer player, Pose pose, ServerLevel level) {
+        // Headless CI servers let entities fall between probe ticks; pin the pose for the run.
+        // Original gravity is restored in cleanup() for both the real player and fake players.
+        if (player != null && !player.isNoGravity()) {
+            player.setNoGravity(true);
+            GRAVITY_CHANGED.add(player);
+        }
         player.teleportTo(level, pose.x, pose.y, pose.z, Set.of(), pose.yaw, pose.pitch, false);
         player.setDeltaMovement(Vec3.ZERO);
     }
@@ -431,9 +440,19 @@ public final class TpaProbe {
     }
 
     private static void cleanup() {
-        if (BOTS.isEmpty()) return;
         try {
-            call("unregisterTestPlayers", new Class<?>[0]);
+            try {
+                for (ServerPlayer player : GRAVITY_CHANGED) {
+                    try {
+                        player.setNoGravity(false);
+                    } catch (Throwable ignored) {
+                        // Best effort; the verdict is already decided.
+                    }
+                }
+            } finally {
+                GRAVITY_CHANGED.clear();
+                call("unregisterTestPlayers", new Class<?>[0]);
+            }
         } catch (Throwable ignored) {
             // Best-effort cleanup; verdict is already decided.
         }

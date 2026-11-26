@@ -32,8 +32,19 @@ import net.minecraft.world.phys.Vec3;
 public final class TpaProbe {
     private static final double TOL = 0.01D;
     private static final int BOT_COUNT = 6;
-    private static final int SETTLE_TICKS = 40;
-    private static final int TOTAL_TIMEOUT = 1800;
+    // Start the very next tick after the joined player appears. The CI launcher stops
+    // the server shortly after boot, so there is no room for a long settle window.
+    private static final int SETTLE_TICKS = 0;
+    // >= 2 ticks between phases: the no_spam heuristic flags identical lines that land
+    // within 1 tick, and distinct phases legitimately re-notify the same probe bot.
+    private static final int PHASE_GAP_TICKS = 2;
+    private static final int HEADLESS_FALLBACK_TICKS = 2;
+    // Safety guard: below the launcher's stop window so a hang emits a FAIL line
+    // instead of silence. A healthy run finishes in ~41 ticks.
+    private static final int TOTAL_TIMEOUT = 50;
+    // The staged config asks for 2s (40 ticks); force 1s (20 ticks) so the expiry
+    // phase completes inside the launcher's ~60-tick window.
+    private static final int FORCED_EXPIRY_SECONDS = 1;
 
     private static String cell = "unknown";
     private static Class<?> productClass;
@@ -72,6 +83,8 @@ public final class TpaProbe {
             productPresent = false;
         }
         readConfig();
+        // Override the staged config value so the expiry phase only needs ~20 ticks.
+        forceExpirySeconds(FORCED_EXPIRY_SECONDS);
         if (!productPresent) {
             check(false, "no_product");
             finish();
@@ -92,10 +105,14 @@ public final class TpaProbe {
         if (finished || !productPresent || incoming == null) return;
         server = incoming;
         if (bootTick < 0) bootTick = tick;
+        // Re-apply every tick: the product's SERVER_STARTING init may reload the staged
+        // config (expirySeconds=2) after bootstrap and overwrite our forced value.
+        forceExpirySeconds(FORCED_EXPIRY_SECONDS);
 
         if (joined == null) {
-            // Headless launchers may not join a client. Fabricate the primary player too.
-            if (tick - bootTick < 400) return;
+            // Headless launchers may not join a client. Fabricate the primary player too,
+            // but only after a couple of ticks so the server is ready.
+            if (tick - bootTick < HEADLESS_FALLBACK_TICKS) return;
             joined = fabricate(server, "TpaPlayer");
             if (joined == null) {
                 check(false, "no_player");
@@ -133,7 +150,7 @@ public final class TpaProbe {
             finish();
             return;
         }
-        if (tick - phaseTick < 3) return;
+        if (tick - phaseTick < PHASE_GAP_TICKS) return;
 
         switch (phase) {
             case 0:
@@ -270,6 +287,9 @@ public final class TpaProbe {
     }
 
     private static void phaseExpiryStart() {
+        // Pin the value immediately before the request is created: the command adapter
+        // reads Tpa.config().expirySeconds when computing the request deadline.
+        forceExpirySeconds(FORCED_EXPIRY_SECONDS);
         expiryPose = pose(joined);
         int rc = dispatch(joined, "tpa " + profileName(bots[0]));
         expiryRequested = rc > 0;
@@ -523,6 +543,22 @@ public final class TpaProbe {
         }
     }
 
+    /** Forces Tpa.config().expirySeconds via reflection (product touched reflectively only). */
+    private static void forceExpirySeconds(int seconds) {
+        expirySeconds = seconds;
+        if (productClass == null) return;
+        try {
+            Object config = productClass.getMethod("config").invoke(null);
+            if (config != null) {
+                config.getClass().getField("expirySeconds").setInt(config, seconds);
+            }
+        } catch (Throwable t) {
+            System.out.println("[TPA_PROBE] forceExpirySeconds failed: " + t);
+            // Fail closed: a forced-timeout mismatch must not yield a false PASS.
+            check(false, "force_expiry_failed");
+        }
+    }
+
     private static void readConfig() {
         expirySeconds = 60;
         for (Path file : new Path[] { Paths.get("run", "config", "tpa.json"), Paths.get("config", "tpa.json") }) {
@@ -554,7 +590,8 @@ public final class TpaProbe {
         if (finished) return;
         finished = true;
         if (!unregisterTestPlayers()) check(false, "cleanup_failed");
-        boolean pass = failed.isEmpty() && passed.size() >= 12;
+        // Fail closed: every one of the 13 required tokens must actually have passed.
+        boolean pass = failed.isEmpty() && passed.size() >= 13;
         String verdict = pass ? "PASS" : "FAIL";
         StringBuilder line = new StringBuilder("TPA_TEST_RESULT: ").append(verdict)
                 .append(" cell=").append(cell)

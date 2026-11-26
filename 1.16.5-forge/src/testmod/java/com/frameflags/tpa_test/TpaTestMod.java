@@ -42,8 +42,8 @@ public final class TpaTestMod {
     private static final String PREFIX = "TPA_TEST_RESULT:";
     private static final String PRODUCT = "com.frameflags.tpa.Tpa";
     private static final double TOL = 0.01D;
-    private static final int PLAYER_WAIT_TICKS = 60;
-    private static final int TIMEOUT_TICKS = 1200;
+    private static final int JOIN_FALLBACK_TICKS = 8;
+    private static final int TIMEOUT_TICKS = 60;
     private static final int BOT_COUNT = 6;
     private static final String[] REQUIRED = {
             "request_ok", "self_rejected", "no_such_player", "duplicate_rejected",
@@ -119,7 +119,8 @@ public final class TpaTestMod {
         }
 
         if (playerA == null) {
-            if (tick - launchTick < PLAYER_WAIT_TICKS) return;
+            // Start immediately on the launcher client's join; short fallback if none joins.
+            if (!joinedPlayerPresent() && tick - launchTick < JOIN_FALLBACK_TICKS) return;
             playerA = fabricate("TpaProbe_A");
             if (playerA == null) return;
             idA = playerA.getUUID();
@@ -462,16 +463,21 @@ public final class TpaTestMod {
         }
     }
 
+    /** A real launcher client lives in PlayerList; probe fakes never enter it. */
+    private static boolean joinedPlayerPresent() {
+        return server != null && !server.getPlayerList().getPlayers().isEmpty();
+    }
+
     private static void ensureConfig() {
         try {
             Object config = call("config", new Class<?>[0]);
             if (config == null) return;
+            // The harness quits ~100 ticks after join. Force the 20-tick deadline so expiry
+            // fires inside the window; CI stages 2s and the old ">10" guard left it at 40 ticks.
             Field field = config.getClass().getField("expirySeconds");
-            Object current = field.get(config);
-            if (current instanceof Integer && ((Integer) current).intValue() > 10) field.set(config, Integer.valueOf(2));
+            field.set(config, Integer.valueOf(1));
             field = config.getClass().getField("maxOutgoing");
-            current = field.get(config);
-            if (current instanceof Integer && ((Integer) current).intValue() != 5) field.set(config, Integer.valueOf(5));
+            field.set(config, Integer.valueOf(5));
         } catch (Throwable ignored) {
             // Defaults apply.
         }

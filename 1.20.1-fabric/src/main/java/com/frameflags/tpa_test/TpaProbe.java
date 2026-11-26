@@ -30,8 +30,8 @@ import net.minecraft.world.phys.Vec3;
 public final class TpaProbe {
     private static final double TOL = 0.01D;
     private static final int BOT_COUNT = 6;
-    private static final int SETTLE_TICKS = 20;
-    private static final int TIMEOUT_TICKS = 1200;
+    private static final int JOIN_FALLBACK_TICKS = 8;
+    private static final int TIMEOUT_TICKS = 60;
     private static final String[] REQUIRED = {
             "request_ok", "self_rejected", "no_such_player", "duplicate_rejected",
             "accept_ok", "tpahere_ok", "snapshot_ok", "deny_ok", "cancel_ok",
@@ -49,6 +49,7 @@ public final class TpaProbe {
     private static ServerPlayer[] bots;
     private static final Map<UUID, String> names = new HashMap<UUID, String>();
     private static int bootTick = -1;
+    private static boolean joinSeen;
     private static int startTick;
     private static int phase;
     private static int phaseTick;
@@ -81,9 +82,9 @@ public final class TpaProbe {
         }
     }
 
-    /** Joined clients are ignored: fabricated players keep the run deterministic. */
+    /** A joined launcher client only triggers the start; it is never used as a probe actor. */
     public static void onJoin(ServerPlayer player, int tick) {
-        // No-op: see onTick, which fabricates the stable participant set.
+        joinSeen = true;
     }
 
     public static void onTick(MinecraftServer incoming, int tick) {
@@ -92,8 +93,8 @@ public final class TpaProbe {
         if (bootTick < 0) bootTick = tick;
 
         if (alpha == null) {
-            // Fabricate a stable primary player; no joined client is required.
-            if (tick - bootTick < 100) return;
+            // Start immediately on the launcher client's join; short fallback if none joins.
+            if (!joinSeen && !joinedPlayerPresent() && tick - bootTick < JOIN_FALLBACK_TICKS) return;
             alpha = fabricate("TpaProbeAlpha");
             if (alpha == null) {
                 check(false, "no_player");
@@ -125,7 +126,6 @@ public final class TpaProbe {
             phaseTick = tick;
         }
 
-        if (tick - startTick < SETTLE_TICKS) return;
         if (tick - startTick > TIMEOUT_TICKS) {
             check(false, "timeout");
             finish();
@@ -459,21 +459,20 @@ public final class TpaProbe {
         }
     }
 
-    /** CI stages a 2s expiry; override an unexpected default so the run stays short. */
+    /** A real launcher client lives in PlayerList; probe fakes never enter it. */
+    private static boolean joinedPlayerPresent() {
+        return server != null && !server.getPlayerList().getPlayers().isEmpty();
+    }
+
+    /** The harness quits ~100 ticks after join: force a 20-tick deadline unconditionally. */
     private static void ensureConfig() {
         try {
             Object config = call("config", new Class<?>[0]);
             if (config == null) return;
             java.lang.reflect.Field field = config.getClass().getField("expirySeconds");
-            Object current = field.get(config);
-            if (current instanceof Integer && ((Integer) current).intValue() > 10) {
-                field.set(config, Integer.valueOf(2));
-            }
+            field.set(config, Integer.valueOf(1));
             field = config.getClass().getField("maxOutgoing");
-            current = field.get(config);
-            if (current instanceof Integer && ((Integer) current).intValue() != 5) {
-                field.set(config, Integer.valueOf(5));
-            }
+            field.set(config, Integer.valueOf(5));
             Object seconds = config.getClass().getField("expirySeconds").get(config);
             if (seconds instanceof Integer) expirySeconds = ((Integer) seconds).intValue();
         } catch (Throwable ignored) {

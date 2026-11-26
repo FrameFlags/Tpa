@@ -148,7 +148,10 @@ public final class TpaCommands {
                 if (guest != null && request.snapshot != null) {
                     Tpa.teleport(guest, request.snapshot, server);
                     affected++;
-                    Tpa.tell(server, guest.getUUID(), ChatFormatting.GREEN + actor.getGameProfile().name()
+                    // The requester gets the acceptance DM; the acceptor gets the command summary.
+                    // For /tpahere the acceptor is also the teleported guest, so notifying the
+                    // guest here would send two messages to one side and none to the other.
+                    Tpa.tell(server, other, ChatFormatting.GREEN + actor.getGameProfile().name()
                             + " accepted your request. Teleporting.", tick);
                 } else {
                     Tpa.tell(server, other, ChatFormatting.RED + "The requester is no longer online.", tick);
