@@ -4,6 +4,7 @@ import com.frameflags.tpa.core.RequestRegistry;
 import com.frameflags.tpa.core.TpaConfig;
 import com.frameflags.tpa.core.TpaPose;
 import com.frameflags.tpa.core.TpaRequest;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -27,6 +28,8 @@ import net.minecraft.world.phys.Vec3;
 public final class Tpa {
     private static final RequestRegistry REGISTRY = new RequestRegistry();
     private static final Map<UUID, List<String>> CHAT = new ConcurrentHashMap<>();
+    /** Probe-only virtual players. Deliberately absent from PlayerList: no connection to broadcast to. */
+    private static final List<ServerPlayer> TEST_PLAYERS = new ArrayList<>();
     private static TpaConfig config = new TpaConfig();
     private static Path gameDir = Path.of(".");
 
@@ -78,10 +81,67 @@ public final class Tpa {
         if (player != null) CHAT.remove(player);
     }
 
+    /** Probe-only hook: registers a fabricated player for lookup without touching PlayerList. */
+    public static synchronized void registerTestPlayer(ServerPlayer player) {
+        if (player != null && !TEST_PLAYERS.contains(player)) TEST_PLAYERS.add(player);
+    }
+
+    /** Probe-only hook: removes every fabricated player. */
+    public static synchronized void unregisterTestPlayers() {
+        TEST_PLAYERS.clear();
+    }
+
+    /** Profile name via reflection: getName() on older versions, name() on 26.x records. */
+    private static String profileName(ServerPlayer player) {
+        if (player == null) return null;
+        Object profile;
+        try {
+            profile = player.getGameProfile();
+        } catch (Throwable ignored) {
+            return null;
+        }
+        if (profile == null) return null;
+        for (String accessor : new String[] { "name", "getName" }) {
+            try {
+                Method method = profile.getClass().getMethod(accessor);
+                Object value = method.invoke(profile);
+                if (value instanceof String) return (String) value;
+            } catch (Throwable ignored) {
+                // Try the other accessor.
+            }
+        }
+        return null;
+    }
+
+    /** True when a usable target other than self exists, real or probe-only. */
+    public static synchronized boolean hasOtherPlayers(ServerPlayer self, MinecraftServer server) {
+        if (server == null) return false;
+        UUID selfId = self == null ? null : self.getUUID();
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player != null && !player.getUUID().equals(selfId)) return true;
+        }
+        for (ServerPlayer player : TEST_PLAYERS) {
+            if (player != null && !player.getUUID().equals(selfId)) return true;
+        }
+        return false;
+    }
+
+    /** Finds a player by UUID in the real roster first, then the probe-only list. */
+    public static synchronized ServerPlayer findPlayer(MinecraftServer server, UUID id) {
+        if (server == null || id == null) return null;
+        ServerPlayer real = server.getPlayerList().getPlayer(id);
+        if (real != null) return real;
+        for (ServerPlayer candidate : TEST_PLAYERS) {
+            if (candidate != null && id.equals(candidate.getUUID())) return candidate;
+        }
+        return null;
+    }
+
     /** Server stop: all state is ephemeral. */
     public static void clear() {
         REGISTRY.clear();
         CHAT.clear();
+        unregisterTestPlayers();
     }
 
     /** Disconnect, death and logout safety net. */
@@ -94,17 +154,31 @@ public final class Tpa {
         if (player == null) return;
         chat(player, text, tick);
         if (server == null) return;
-        ServerPlayer target = server.getPlayerList().getPlayer(player);
+        ServerPlayer target = findPlayer(server, player);
         if (target != null) target.sendSystemMessage(Component.literal(text));
     }
 
-    /** Online player lookup by exact name, then case-insensitively. */
+    /** Online player lookup: probe-only players by name first, then normal server lookup. */
     public static ServerPlayer resolveTarget(MinecraftServer server, String name) {
-        if (server == null || name == null) return null;
-        ServerPlayer exact = server.getPlayerList().getPlayer(name);
+        if (name == null) return null;
+        String needle = name.trim();
+        if (needle.isEmpty()) return null;
+        synchronized (Tpa.class) {
+            for (ServerPlayer player : TEST_PLAYERS) {
+                String candidate = profileName(player);
+                if (needle.equals(candidate)) return player;
+            }
+            for (ServerPlayer player : TEST_PLAYERS) {
+                String candidate = profileName(player);
+                if (needle.equalsIgnoreCase(candidate)) return player;
+            }
+        }
+        if (server == null) return null;
+        ServerPlayer exact = server.getPlayerList().getPlayer(needle);
         if (exact != null) return exact;
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (name.equalsIgnoreCase(player.getGameProfile().name())) return player;
+            String candidate = profileName(player);
+            if (candidate != null && needle.equalsIgnoreCase(candidate)) return player;
         }
         return null;
     }

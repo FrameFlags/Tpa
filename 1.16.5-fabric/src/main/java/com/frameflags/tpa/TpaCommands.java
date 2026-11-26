@@ -85,17 +85,12 @@ public final class TpaCommands {
 
     static void notify(UUID uuid, MinecraftServer server, String text) {
         Tpa.chat(uuid, text, (int) Tpa.tick());
-        if (server == null || uuid == null) return;
-        ServerPlayerEntity player = server.getPlayerManager().getPlayer(uuid);
+        ServerPlayerEntity player = Tpa.findPlayer(server, uuid);
         if (player != null) player.sendMessage(new LiteralText(text), false);
     }
 
     static ServerPlayerEntity resolveTarget(MinecraftServer server, String name) {
-        if (server == null || name == null || name.trim().isEmpty()) return null;
-        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            if (player != null && name.equalsIgnoreCase(player.getName().getString())) return player;
-        }
-        return null;
+        return Tpa.resolveTarget(server, name);
     }
 
     static TpaPose pose(ServerPlayerEntity player) {
@@ -233,7 +228,7 @@ public final class TpaCommands {
                 }
                 teleport(player, request.snapshot, server);
             } else {
-                ServerPlayerEntity mover = server.getPlayerManager().getPlayer(request.requester);
+                ServerPlayerEntity mover = Tpa.findPlayer(server, request.requester);
                 if (mover == null) {
                     chat(source, "The requester is offline; request cancelled.");
                     Tpa.registry().remove(request.id);

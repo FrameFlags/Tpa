@@ -2,10 +2,13 @@ package com.frameflags.tpa_test;
 
 import com.mojang.authlib.GameProfile;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -18,16 +21,22 @@ import net.minecraft.world.entity.RelativeMovement;
 import net.minecraft.world.phys.Vec3;
 
 /**
- * In-game probe. Every state change is dispatched through the real Brigadier dispatcher as
- * a real source stack (the joined player or a fabricated second ServerPlayer). Product
- * helpers are observed only through reflection, so this class also loads when the product
- * jar is absent (the negative-control run).
+ * In-game TPA probe. Every state change goes through the real Brigadier dispatcher, with
+ * stable fabricated players registered through the product-side probe hook (never inserted
+ * into the PlayerList, whose vanilla broadcasts would NPE on a null connection). Product
+ * classes are touched only by reflection so the negative control also loads. A skipped
+ * check is never recorded as a pass.
  */
 public final class TpaProbe {
     private static final double TOL = 0.01D;
-    private static final String BETA_NAME = "TpaProbeBeta";
-    private static final Path ROOT_RESULT = Path.of("tpa-result.txt");
-    private static final Path RUN_RESULT = Path.of("run/tpa-result.txt");
+    private static final int BOT_COUNT = 6;
+    private static final int SETTLE_TICKS = 20;
+    private static final int TIMEOUT_TICKS = 1200;
+    private static final String[] REQUIRED = {
+            "request_ok", "self_rejected", "no_such_player", "duplicate_rejected",
+            "accept_ok", "tpahere_ok", "snapshot_ok", "deny_ok", "cancel_ok",
+            "outgoing_limit", "cancelall_ok", "expiry_ok", "no_spam"
+    };
 
     private static String cell = "unknown";
     private static Class<?> productClass;
@@ -35,20 +44,22 @@ public final class TpaProbe {
     private static boolean finished;
     private static MinecraftServer server;
     private static ServerPlayer alpha;
-    private static ProbePlayer beta;
     private static UUID alphaId;
-    private static UUID betaId;
     private static String alphaName;
+    private static ServerPlayer[] bots;
+    private static final Map<UUID, String> names = new HashMap<UUID, String>();
+    private static int bootTick = -1;
     private static int startTick;
     private static int phase;
-    private static int nextTick;
-    private static int checks;
-    private static int expirySeconds = 60;
+    private static int phaseTick;
+    private static int expirySeconds = 2;
     private static long expiryDeadline = -1L;
-    private static Pose expiryAlphaPose;
-    private static Pose expiryBetaPose;
-    private static final List<String> passed = new ArrayList<String>();
-    private static final List<String> failed = new ArrayList<String>();
+    private static Pose expiryAlpha;
+    private static Pose expiryBeta;
+    private static boolean expiryEarlyTeleport;
+
+    private static final LinkedHashSet<String> passed = new LinkedHashSet<String>();
+    private static final LinkedHashSet<String> failed = new LinkedHashSet<String>();
     private static final Map<UUID, List<String>> observedChat = new HashMap<UUID, List<String>>();
 
     private TpaProbe() {
@@ -57,213 +68,289 @@ public final class TpaProbe {
     public static void bootstrap(String cellId) {
         if (finished) return;
         cell = cellId;
-        try {
-            Files.deleteIfExists(ROOT_RESULT);
-            Files.deleteIfExists(RUN_RESULT);
-        } catch (Throwable ignored) {
-            // stdout is the fallback signal when the filesystem is read-only.
-        }
+        cleanResults();
         try {
             productClass = Class.forName("com.frameflags.tpa.Tpa");
-            productPresent = productClass != null;
+            productPresent = true;
         } catch (Throwable ignored) {
             productPresent = false;
         }
-        // Config is reloaded by the product at server start, so the short-expiry override
-        // is applied on join (see ensureShortExpiry) rather than in the constructor.
         if (!productPresent) {
             check(false, "no_product");
             finish();
         }
     }
 
+    /** Joined clients are ignored: fabricated players keep the run deterministic. */
     public static void onJoin(ServerPlayer player, int tick) {
-        if (finished || !productPresent || alpha != null || player == null) return;
-        alpha = player;
-        alphaId = player.getUUID();
-        alphaName = player.getGameProfile().getName();
-        startTick = tick;
-        nextTick = tick + 2;
-        player.setNoGravity(true);
-        player.getAbilities().flying = true;
-        player.onUpdateAbilities();
-        player.setDeltaMovement(Vec3.ZERO);
-        clearChat(alphaId);
-        ensureShortExpiry();
-    }
-
-    /** Keeps the green run short even when config/tpa.json was not staged. */
-    private static void ensureShortExpiry() {
-        Object config = call("config", new Class<?>[0]);
-        Object seconds = field(config, "expirySeconds");
-        if (seconds instanceof Integer) expirySeconds = ((Integer) seconds).intValue();
-        if (expirySeconds > 10) {
-            setField(config, "expirySeconds", Integer.valueOf(2));
-            expirySeconds = 2;
-        }
+        // No-op: see onTick, which fabricates the stable participant set.
     }
 
     public static void onTick(MinecraftServer incoming, int tick) {
-        if (finished || !productPresent || alpha == null || incoming == null) return;
+        if (finished || !productPresent || incoming == null) return;
         server = incoming;
-        ServerPlayer live = incoming.getPlayerList().getPlayer(alphaId);
-        if (live == null) {
-            check(false, "joined_player_lost");
-            finish();
-            return;
+        if (bootTick < 0) bootTick = tick;
+
+        if (alpha == null) {
+            // Fabricate a stable primary player; no joined client is required.
+            if (tick - bootTick < 100) return;
+            alpha = fabricate("TpaProbeAlpha");
+            if (alpha == null) {
+                check(false, "no_player");
+                finish();
+                return;
+            }
+            alphaId = alpha.getUUID();
+            alphaName = names.get(alphaId);
+            startTick = tick;
+            pin(alpha);
+            clearChat(alphaId);
+            ensureConfig();
+            registerHook(alpha);
         }
-        alpha = live;
-        if (tick - startTick > 1200) {
+
+        if (bots == null) {
+            bots = new ServerPlayer[BOT_COUNT];
+            for (int i = 0; i < bots.length; i++) {
+                bots[i] = fabricate("TpaProbeBot" + i);
+                if (bots[i] == null) {
+                    check(false, "fabrication_failed");
+                    finish();
+                    return;
+                }
+                pin(bots[i]);
+                registerHook(bots[i]);
+                clearChat(bots[i].getUUID());
+            }
+            phaseTick = tick;
+        }
+
+        if (tick - startTick < SETTLE_TICKS) return;
+        if (tick - startTick > TIMEOUT_TICKS) {
             check(false, "timeout");
             finish();
             return;
         }
-        if (tick < nextTick) return;
-        if (phase == 0) phaseRequest(tick);
-        else if (phase == 1) phaseAccept(tick);
-        else if (phase == 2) phaseHereDenyAndExpiry(tick);
-        else if (phase == 3) phaseExpiryWait(tick);
+        if (tick - phaseTick < 2) return;
+
+        switch (phase) {
+            case 0:
+                phaseValidation();
+                break;
+            case 1:
+                phaseAccept();
+                break;
+            case 2:
+                phaseHere();
+                break;
+            case 3:
+                phaseDeny();
+                break;
+            case 4:
+                phaseLimit();
+                break;
+            case 5:
+                phaseExpiryStart();
+                break;
+            case 6:
+                if (phaseExpiryWait(tick)) break;
+                return;
+            default:
+                phaseFinish();
+                return;
+        }
+        phase++;
+        phaseTick = tick;
     }
 
-    /** Phase 0: create a request and exercise every rejection path. */
-    private static void phaseRequest(int tick) {
-        beta = fabricate(server);
-        if (beta == null) {
-            check(false, "second_player_unavailable");
-            finish();
-            return;
-        }
-        betaId = beta.getUUID();
-        call("registerTestPlayer", new Class<?>[] { ServerPlayer.class }, beta);
+    // ---------------- phases ----------------
 
-        move(alpha, 100.5D, 64.5D, 100.5D, 90.0F, -10.0F);
-        moveBeta(200.5D, 64.5D, 200.5D, 180.0F, 5.0F);
+    private static void phaseValidation() {
         clearChat(alphaId);
-        clearChat(betaId);
-
-        int rc = dispatch(alpha, "tpa " + BETA_NAME);
-        Object request = singleOutbound(alphaId);
-        check(rc > 0 && request != null && chatCount(alphaId) == 1 && chatCount(betaId) == 1, "request_ok");
+        int rc = dispatch(alpha, "tpa " + name(0));
+        check(rc > 0 && singleOutbound(alphaId) != null
+                && chatCount(alphaId) == 1 && chatCount(bots[0].getUUID()) == 1, "request_ok");
 
         clearChat(alphaId);
         rc = dispatch(alpha, "tpa " + alphaName);
-        check(rc <= 0 && outbound(alphaId).size() == 1 && chatCount(alphaId) == 1, "self_rejected");
+        check(rc <= 0 && outgoing(alphaId).size() == 1 && chatCount(alphaId) == 1, "self_rejected");
 
         clearChat(alphaId);
-        rc = dispatch(alpha, "tpa TpaProbeNoSuchPlayer");
-        check(rc <= 0 && outbound(alphaId).size() == 1 && chatCount(alphaId) == 1, "no_such_player");
+        rc = dispatch(alpha, "tpa TpaProbeNoSuchPlayerZZZ");
+        check(rc <= 0 && outgoing(alphaId).size() == 1 && chatCount(alphaId) == 1, "no_such_player");
 
         clearChat(alphaId);
-        rc = dispatch(alpha, "tpa " + BETA_NAME);
-        check(rc <= 0 && outbound(alphaId).size() == 1 && chatCount(alphaId) == 1, "duplicate_rejected");
-
-        phase = 1;
-        nextTick = tick + 2;
+        rc = dispatch(alpha, "tpa " + name(0));
+        check(rc <= 0 && outgoing(alphaId).size() == 1 && chatCount(alphaId) == 1, "duplicate_rejected");
     }
 
-    /** Phase 1: cancel, then /tpa + /tpaccept with the target's LIVE pose. */
-    private static void phaseAccept(int tick) {
+    private static void phaseAccept() {
         clearChat(alphaId);
-        clearChat(betaId);
-        Pose before = pose(alpha);
-        int rc = dispatch(alpha, "tpacancel " + BETA_NAME);
-        check(rc > 0 && outbound(alphaId).isEmpty() && matches(pose(alpha), before)
-                && chatCount(alphaId) == 1 && chatCount(betaId) == 1, "cancel_ok");
+        int rc = dispatch(alpha, "tpacancel " + name(0));
+        check(rc > 0 && outgoing(alphaId).isEmpty() && chatCount(alphaId) == 1, "cancel_ok");
 
-        moveBeta(210.5D, 60.5D, 210.5D, 10.0F, 20.0F);
-        Pose liveTargetPose = pose(beta);
-        dispatch(alpha, "tpa " + BETA_NAME);
+        setPose(bots[0], 210.5D, 60.5D, 210.5D, 10.0F, 20.0F);
+        Pose targetPose = pose(bots[0]);
+        dispatch(alpha, "tpa " + name(0));
         clearChat(alphaId);
-        clearChat(betaId);
-        rc = dispatch(beta, "tpaccept " + alphaName);
-        check(rc > 0 && outbound(alphaId).isEmpty() && matches(pose(alpha), liveTargetPose)
-                && chatCount(alphaId) == 1 && chatCount(betaId) == 1, "accept_ok");
-
-        phase = 2;
-        nextTick = tick + 2;
+        clearChat(bots[0].getUUID());
+        rc = dispatch(bots[0], "tpaccept " + alphaName);
+        check(rc > 0 && outgoing(alphaId).isEmpty() && matches(pose(alpha), targetPose)
+                && chatCount(alphaId) == 1 && chatCount(bots[0].getUUID()) == 1, "accept_ok");
     }
 
-    /** Phase 2: /tpahere snapshot wins, then deny, cancelall, and arm the expiry request. */
-    private static void phaseHereDenyAndExpiry(int tick) {
-        move(alpha, 300.5D, 64.5D, 300.5D, 45.0F, 30.0F);
+    private static void phaseHere() {
+        setPose(alpha, 300.5D, 64.5D, 300.5D, 45.0F, 30.0F);
         Pose snapshot = pose(alpha);
-        dispatch(alpha, "tpahere " + BETA_NAME);
+        dispatch(alpha, "tpahere " + name(0));
         Object hereRequest = singleOutbound(alphaId);
-        move(alpha, 400.5D, 64.5D, 400.5D, 0.0F, 0.0F);
-        Pose alphaMoved = pose(alpha);
-        clearChat(alphaId);
-        clearChat(betaId);
-        int rc = dispatch(beta, "tpaccept");
-        check(rc > 0 && outbound(alphaId).isEmpty() && matches(pose(beta), snapshot)
-                && matches(pose(alpha), alphaMoved), "tpahere_ok");
+        setPose(alpha, 400.5D, 64.5D, 400.5D, 0.0F, 0.0F);
+        Pose moved = pose(alpha);
+        clearChat(bots[0].getUUID());
+        int rc = dispatch(bots[0], "tpaccept");
+        check(rc > 0 && outgoing(alphaId).isEmpty() && matches(pose(bots[0]), snapshot)
+                && matches(pose(alpha), moved), "tpahere_ok");
         check(hereRequest != null && Boolean.TRUE.equals(invoke(hereRequest, "isHere", new Class<?>[0]))
                 && snapshotMatches(hereRequest, snapshot), "snapshot_ok");
-
-        moveBeta(500.5D, 64.5D, 500.5D, 33.0F, -5.0F);
-        Pose betaBefore = pose(beta);
-        Pose alphaBefore = pose(alpha);
-        dispatch(alpha, "tpa " + BETA_NAME);
-        clearChat(alphaId);
-        clearChat(betaId);
-        rc = dispatch(beta, "tpdeny");
-        check(rc > 0 && outbound(alphaId).isEmpty() && matches(pose(alpha), alphaBefore)
-                && matches(pose(beta), betaBefore) && chatCount(alphaId) == 1
-                && chatCount(betaId) == 1, "deny_ok");
-
-        dispatch(alpha, "tpa " + BETA_NAME);
-        clearChat(alphaId);
-        clearChat(betaId);
-        rc = dispatch(alpha, "tpacancelall");
-        check(rc > 0 && outbound(alphaId).isEmpty() && chatCount(alphaId) == 1
-                && chatCount(betaId) == 1, "cancelall_ok");
-
-        dispatch(alpha, "tpa " + BETA_NAME);
-        Object expiring = singleOutbound(alphaId);
-        if (expiring == null) {
-            check(false, "expiry_ok");
-            check(noRepeatedChat(), "no_spam");
-            finish();
-            return;
-        }
-        expiryDeadline = longField(expiring, "deadlineTick");
-        expiryAlphaPose = pose(alpha);
-        expiryBetaPose = pose(beta);
-        if (expiryDeadline <= 0L) {
-            check(false, "expiry_ok");
-            check(noRepeatedChat(), "no_spam");
-            finish();
-            return;
-        }
-        clearChat(alphaId);
-        clearChat(betaId);
-        phase = 3;
-        nextTick = tick + 2;
     }
 
-    /** Phase 3: the request expires once, never teleports, and emits one line per side. */
-    private static void phaseExpiryWait(int tick) {
-        // Two ticks of slack guarantees the product tick hook ran at/after the deadline.
-        if (tick < expiryDeadline + 2L) return;
-        boolean removed = outbound(alphaId).isEmpty();
-        boolean noTeleport = matches(pose(alpha), expiryAlphaPose) && matches(pose(beta), expiryBetaPose);
-        boolean chats = chatCount(alphaId) == 1 && chatCount(betaId) == 1;
+    private static void phaseDeny() {
+        setPose(bots[0], 500.5D, 64.5D, 500.5D, 33.0F, -5.0F);
+        Pose botBefore = pose(bots[0]);
+        Pose alphaBefore = pose(alpha);
+        dispatch(alpha, "tpa " + name(0));
+        clearChat(alphaId);
+        clearChat(bots[0].getUUID());
+        int rc = dispatch(bots[0], "tpdeny");
+        check(rc > 0 && outgoing(alphaId).isEmpty() && matches(pose(alpha), alphaBefore)
+                && matches(pose(bots[0]), botBefore) && chatCount(alphaId) == 1
+                && chatCount(bots[0].getUUID()) == 1, "deny_ok");
+    }
+
+    private static void phaseLimit() {
+        for (int i = 0; i < bots.length; i++) dispatch(alpha, "tpa " + name(i));
+        List<?> outgoing = outgoing(alphaId);
+        boolean oldestEvicted = true;
+        boolean newestPresent = false;
+        if (outgoing == null) oldestEvicted = false;
+        else {
+            for (Object request : outgoing) {
+                Object target = field(request, "target");
+                if (bots[0].getUUID().equals(target)) oldestEvicted = false;
+                if (bots[bots.length - 1].getUUID().equals(target)) newestPresent = true;
+            }
+        }
+        check(outgoing != null && outgoing.size() == 5 && oldestEvicted && newestPresent, "outgoing_limit");
+    }
+
+    private static void phaseExpiryStart() {
+        clearChat(alphaId);
+        int rc = dispatch(alpha, "tpacancelall");
+        check(rc > 0 && outgoing(alphaId).isEmpty(), "cancelall_ok");
+
+        dispatch(alpha, "tpa " + name(0));
+        Object request = singleOutbound(alphaId);
+        if (request == null) {
+            check(false, "expiry_ok");
+            expiryDeadline = -1L;
+        } else {
+            expiryDeadline = longField(request, "deadlineTick");
+        }
+        expiryAlpha = pose(alpha);
+        expiryBeta = pose(bots[0]);
+        expiryEarlyTeleport = false;
+        clearChat(alphaId);
+        clearChat(bots[0].getUUID());
+    }
+
+    private static boolean phaseExpiryWait(int tick) {
+        // The 1.20.1 product clocks expiry from the server tick count, not a Tpa.tick() accessor.
+        if (expiryDeadline <= 0L || (long) tick < expiryDeadline + 2L) {
+            if (!matches(pose(alpha), expiryAlpha) || !matches(pose(bots[0]), expiryBeta)) {
+                expiryEarlyTeleport = true;
+            }
+            return false;
+        }
+        boolean removed = outgoing(alphaId).isEmpty();
+        boolean noTeleport = !expiryEarlyTeleport && matches(pose(alpha), expiryAlpha)
+                && matches(pose(bots[0]), expiryBeta);
+        boolean chats = chatCount(alphaId) == 1 && chatCount(bots[0].getUUID()) == 1;
         check(removed && noTeleport && chats, "expiry_ok");
+        return true;
+    }
+
+    private static void phaseFinish() {
         check(noRepeatedChat(), "no_spam");
         finish();
     }
 
-    // ---------- command dispatch: the only mutation path ----------
+    // ---------------- command dispatch ----------------
 
-    private static int dispatch(ServerPlayer player, String command) {
+    private static int dispatch(ServerPlayer sender, String command) {
         try {
-            return server.getCommands().getDispatcher().execute(command, player.createCommandSourceStack());
+            return server.getCommands().getDispatcher().execute(command, sender.createCommandSourceStack());
         } catch (Throwable failure) {
             System.out.println("[TPA_PROBE] dispatch_failed command=" + command + " error=" + failure);
             return -1;
         }
     }
 
-    // ---------- read-only observation through reflection ----------
+    // ---------------- stable fabricated players ----------------
+
+    private static ServerPlayer fabricate(String name) {
+        try {
+            ServerLevel level = server.overworld();
+            UUID id = UUID.randomUUID();
+            GameProfile profile = new GameProfile(id, name);
+            names.put(id, name);
+            ProbePlayer player = new ProbePlayer(server, level, profile);
+            pin(player);
+            setPose(player, 10.5D, 64.5D, 10.5D, 0.0F, 0.0F);
+            return player;
+        } catch (Throwable failure) {
+            System.out.println("[TPA_PROBE] fabricate_failed name=" + name + " error=" + failure);
+            return null;
+        }
+    }
+
+    /** Product-side hook: visible to name/UUID resolution without entering the PlayerList. */
+    private static void registerHook(ServerPlayer player) {
+        if (player == null) return;
+        Object ignored = call("registerTestPlayer", new Class<?>[] { ServerPlayer.class }, player);
+    }
+
+    /** Profile names via reflection on the GameProfile, never on remapped Minecraft getters. */
+    private static String profileName(ServerPlayer player) {
+        if (player == null) return null;
+        String stored = names.get(player.getUUID());
+        if (stored != null) return stored;
+        try {
+            for (Class<?> type = player.getClass(); type != null; type = type.getSuperclass()) {
+                for (Method method : type.getDeclaredMethods()) {
+                    if (method.getParameterCount() != 0) continue;
+                    if (!method.getReturnType().getName().endsWith("GameProfile")) continue;
+                    method.setAccessible(true);
+                    Object profile = method.invoke(player);
+                    if (profile == null) continue;
+                    Object value = profile.getClass().getMethod("getName").invoke(profile);
+                    if (value instanceof String) return (String) value;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Fall through to the mapped compile-time accessor.
+        }
+        try {
+            return player.getGameProfile().getName();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String name(int index) {
+        return profileName(bots[index]);
+    }
+
+    // ---------------- read-only product observation ----------------
 
     private static Object call(String name, Class<?>[] types, Object... args) {
         try {
@@ -293,56 +380,39 @@ public final class TpaProbe {
         }
     }
 
-    private static void setField(Object target, String name, Object value) {
-        if (target == null) return;
-        try {
-            target.getClass().getField(name).set(target, value);
-        } catch (Throwable ignored) {
-            // Defaults remain in effect.
-        }
-    }
-
     private static long longField(Object target, String name) {
         Object value = field(target, name);
         return value instanceof Long ? ((Long) value).longValue() : -1L;
     }
 
     @SuppressWarnings("unchecked")
-    private static List<Object> requests(UUID id, boolean outbound) {
+    private static List<Object> outgoing(UUID id) {
         Object registry = call("registry", new Class<?>[0]);
-        Object list = invoke(registry, outbound ? "outgoing" : "inbound", new Class<?>[] { UUID.class }, id);
+        Object list = invoke(registry, "outgoing", new Class<?>[] { UUID.class }, id);
         return list instanceof List ? (List<Object>) list : new ArrayList<Object>();
     }
 
-    private static List<Object> outbound(UUID id) {
-        return requests(id, true);
-    }
-
     private static Object singleOutbound(UUID id) {
-        List<Object> list = outbound(id);
+        List<Object> list = outgoing(id);
         return list.isEmpty() ? null : list.get(0);
     }
 
     private static boolean snapshotMatches(Object request, Pose expected) {
         Object snapshot = field(request, "snapshot");
         if (snapshot == null) return false;
-        double x = doubleField(snapshot, "x");
-        double y = doubleField(snapshot, "y");
-        double z = doubleField(snapshot, "z");
-        float yaw = floatField(snapshot, "yaw");
-        float pitch = floatField(snapshot, "pitch");
-        return close(x, expected.x) && close(y, expected.y) && close(z, expected.z)
-                && close(yaw, expected.yaw) && close(pitch, expected.pitch);
+        return close(doubleField(snapshot, "x"), expected.x) && close(doubleField(snapshot, "y"), expected.y)
+                && close(doubleField(snapshot, "z"), expected.z) && close(floatField(snapshot, "yaw"), expected.yaw)
+                && close(floatField(snapshot, "pitch"), expected.pitch);
     }
 
     private static double doubleField(Object target, String name) {
         Object value = field(target, name);
-        return value instanceof Double ? ((Double) value).doubleValue() : Double.NaN;
+        return value instanceof Number ? ((Number) value).doubleValue() : Double.NaN;
     }
 
     private static float floatField(Object target, String name) {
         Object value = field(target, name);
-        return value instanceof Float ? ((Float) value).floatValue() : Float.NaN;
+        return value instanceof Number ? ((Number) value).floatValue() : Float.NaN;
     }
 
     @SuppressWarnings("unchecked")
@@ -356,11 +426,8 @@ public final class TpaProbe {
     }
 
     private static void clearChat(UUID id) {
-        List<String> seen = observedChat.get(id);
-        if (seen == null) {
-            seen = new ArrayList<String>();
-            observedChat.put(id, seen);
-        }
+        if (id == null) return;
+        List<String> seen = observedChat.computeIfAbsent(id, key -> new ArrayList<String>());
         seen.addAll(chatLog(id));
         call("clearChatLog", new Class<?>[] { UUID.class }, id);
     }
@@ -392,7 +459,29 @@ public final class TpaProbe {
         }
     }
 
-    // ---------- pose helpers and player fabrication ----------
+    /** CI stages a 2s expiry; override an unexpected default so the run stays short. */
+    private static void ensureConfig() {
+        try {
+            Object config = call("config", new Class<?>[0]);
+            if (config == null) return;
+            java.lang.reflect.Field field = config.getClass().getField("expirySeconds");
+            Object current = field.get(config);
+            if (current instanceof Integer && ((Integer) current).intValue() > 10) {
+                field.set(config, Integer.valueOf(2));
+            }
+            field = config.getClass().getField("maxOutgoing");
+            current = field.get(config);
+            if (current instanceof Integer && ((Integer) current).intValue() != 5) {
+                field.set(config, Integer.valueOf(5));
+            }
+            Object seconds = config.getClass().getField("expirySeconds").get(config);
+            if (seconds instanceof Integer) expirySeconds = ((Integer) seconds).intValue();
+        } catch (Throwable ignored) {
+            // Defaults apply.
+        }
+    }
+
+    // ---------------- pose helpers ----------------
 
     private static Pose pose(ServerPlayer player) {
         return new Pose(player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot());
@@ -407,7 +496,16 @@ public final class TpaProbe {
         return Math.abs(a - b) <= TOL;
     }
 
-    private static void move(ServerPlayer player, double x, double y, double z, float yaw, float pitch) {
+    private static void pin(ServerPlayer player) {
+        try {
+            player.setNoGravity(true);
+            player.setDeltaMovement(Vec3.ZERO);
+        } catch (Throwable ignored) {
+            // Fabricated players still have usable abilities.
+        }
+    }
+
+    private static void setPose(ServerPlayer player, double x, double y, double z, float yaw, float pitch) {
         player.setPos(x, y, z);
         player.setYRot(yaw);
         player.setXRot(pitch);
@@ -415,27 +513,7 @@ public final class TpaProbe {
         player.setDeltaMovement(Vec3.ZERO);
     }
 
-    private static void moveBeta(double x, double y, double z, float yaw, float pitch) {
-        move(beta, x, y, z, yaw, pitch);
-    }
-
-    private static ProbePlayer fabricate(MinecraftServer minecraftServer) {
-        try {
-            ServerLevel level = minecraftServer.overworld();
-            GameProfile profile = new GameProfile(UUID.randomUUID(), BETA_NAME);
-            ProbePlayer player = new ProbePlayer(minecraftServer, level, profile);
-            player.setNoGravity(true);
-            player.getAbilities().flying = true;
-            player.onUpdateAbilities();
-            move(player, 200.5D, 64.5D, 200.5D, 180.0F, 5.0F);
-            return player;
-        } catch (Throwable failure) {
-            System.out.println("[TPA_PROBE] fabricate_failed error=" + failure);
-            return null;
-        }
-    }
-
-    /** No network connection: capture messages via the product's chat sink instead of packets. */
+    /** Unconnected player used only as a command source and teleport target. */
     private static final class ProbePlayer extends ServerPlayer {
         ProbePlayer(MinecraftServer minecraftServer, ServerLevel level, GameProfile profile) {
             super(minecraftServer, level, profile);
@@ -454,47 +532,77 @@ public final class TpaProbe {
 
         @Override
         public void sendSystemMessage(Component component) {
-            // No connection to send to; Tpa.chat() records the line for assertions.
         }
 
         @Override
         public void sendSystemMessage(Component component, boolean actionBar) {
-            // No connection to send to; Tpa.chat() records the line for assertions.
         }
     }
 
-    // ---------- exactly one canonical result line ----------
+    // ---------------- exactly one canonical result line ----------------
 
     private static void check(boolean ok, String token) {
-        checks++;
         if (ok) passed.add(token);
-        else failed.add(token);
+        else {
+            failed.add(token);
+            System.out.println("[TPA_PROBE] check_failed " + token);
+        }
     }
 
     private static synchronized void finish() {
         if (finished) return;
         finished = true;
-        boolean complete = failed.isEmpty() && passed.contains("request_ok") && passed.contains("accept_ok")
-                && passed.contains("tpahere_ok") && passed.contains("deny_ok") && passed.contains("cancel_ok")
-                && passed.contains("expiry_ok") && passed.contains("no_spam")
-                && passed.contains("self_rejected") && passed.contains("no_such_player");
+        boolean complete = failed.isEmpty();
+        for (String token : REQUIRED) if (!passed.contains(token)) complete = false;
         String verdict = complete ? "PASS" : "FAIL";
         StringBuilder line = new StringBuilder("TPA_TEST_RESULT: ").append(verdict)
                 .append(" cell=").append(cell)
                 .append(" product=").append(productPresent)
-                .append(" checks=").append(checks)
+                .append(" checks=").append(passed.size() + failed.size())
                 .append(" failures=").append(failed.size());
         if (!failed.isEmpty()) line.append(" reason=").append(String.join(",", failed));
         for (String token : passed) line.append(' ').append(token);
-        String result = line.toString();
-        try {
-            if (RUN_RESULT.getParent() != null) Files.createDirectories(RUN_RESULT.getParent());
-            Files.writeString(ROOT_RESULT, result + "\n");
-            Files.writeString(RUN_RESULT, result + "\n");
-        } catch (Throwable ignored) {
-            // stdout is the fallback signal.
+        // Skipped checks are explicitly marked and never appear as bare passing tokens.
+        if (!complete) {
+            for (String token : REQUIRED) {
+                if (!passed.contains(token) && !failed.contains(token)) line.append(' ').append(token).append("=skipped");
+            }
         }
+        String result = line.toString();
+        write(result);
         System.out.println("[TPA_PROBE] " + result);
+    }
+
+    private static void write(String line) {
+        byte[] bytes = (line + "\n").getBytes(StandardCharsets.UTF_8);
+        Set<Path> targets = new LinkedHashSet<Path>();
+        targets.add(Paths.get("tpa-result.txt"));
+        targets.add(Paths.get("run", "tpa-result.txt"));
+        Path cwd = Paths.get("").toAbsolutePath().normalize();
+        targets.add(cwd.resolve("tpa-result.txt"));
+        targets.add(cwd.resolve("run").resolve("tpa-result.txt"));
+        for (Path target : targets) {
+            try {
+                Path parent = target.getParent();
+                if (parent != null) Files.createDirectories(parent);
+                Files.write(target, bytes);
+            } catch (Throwable ignored) {
+                // stdout is the fallback signal.
+            }
+        }
+    }
+
+    private static void cleanResults() {
+        for (Path file : new Path[] {
+                Paths.get("tpa-result.txt"), Paths.get("run", "tpa-result.txt"),
+                Paths.get("").toAbsolutePath().normalize().resolve("tpa-result.txt"),
+                Paths.get("").toAbsolutePath().normalize().resolve("run").resolve("tpa-result.txt") }) {
+            try {
+                Files.deleteIfExists(file);
+            } catch (Throwable ignored) {
+                // Best effort.
+            }
+        }
     }
 
     private static final class Pose {

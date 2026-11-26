@@ -178,7 +178,8 @@ public final class TpaCommands {
         Map<UUID, Integer> summary = new HashMap<UUID, Integer>();
         int handled = 0;
         for (TpaRequest candidate : selected) {
-            TpaRequest request = Tpa.registry().remove(candidate.id);
+            // Peek first: never lose a request when the destination cannot be resolved.
+            TpaRequest request = candidate;
             if (request == null) continue;
             ServerPlayer requester = Tpa.findPlayer(server, request.requester);
             ServerPlayer target = Tpa.findPlayer(server, request.target);
@@ -197,6 +198,7 @@ public final class TpaCommands {
                     teleported = true;
                 }
             }
+            if (teleported || !"accept".equals(action)) Tpa.registry().remove(request.id);
             String requesterText = requesterText(action, targetName(requester, request), teleported);
             String targetText = targetText(action, requesterName(requester, request), teleported);
             if (all) {

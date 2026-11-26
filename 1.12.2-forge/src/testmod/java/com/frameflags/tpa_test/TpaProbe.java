@@ -10,9 +10,9 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -26,23 +26,22 @@ import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 
 /**
- * In-game TPA probe. Every game mutation goes through the real command
- * dispatcher as one of two players; product state is only read reflectively so
- * this jar loads even when the product jar is absent.
+ * In-game TPA probe for Forge 1.12.2. Fabricated players are exposed to the product through
+ * its registerTestPlayer hook and are NEVER inserted into the PlayerList (vanilla broadcasts
+ * would NPE on a null connection). A skipped check is never recorded as a pass.
  */
 public final class TpaProbe {
     private static final String PREFIX = "TPA_TEST_RESULT:";
     private static final String PRODUCT = "com.frameflags.tpa.Tpa";
     private static final double TOL = 0.01D;
-    private static final int PLAYER_WAIT_TICKS = 30;
+    private static final int PLAYER_WAIT_TICKS = 60;
     private static final int TIMEOUT_TICKS = 1200;
+    private static final int BOT_COUNT = 6;
     private static final String[] REQUIRED = {
             "request_ok", "self_rejected", "no_such_player", "duplicate_rejected",
-            "accept_ok", "tpahere_ok", "deny_ok", "cancel_ok", "expiry_ok", "no_spam"
+            "accept_ok", "tpahere_ok", "snapshot_ok", "deny_ok", "cancel_ok",
+            "outgoing_limit", "cancelall_ok", "expiry_ok", "no_spam"
     };
-
-    private static final Pose START_A = new Pose(100.5D, 64.0D, 100.5D, 10.0F, 20.0F);
-    private static final Pose START_B = new Pose(200.5D, 64.0D, 200.5D, 30.0F, 40.0F);
     private static final Pose LIVE = new Pose(311.5D, 70.0D, 322.5D, 77.0F, -13.0F);
     private static final Pose SNAP = new Pose(12.5D, 64.0D, 13.5D, 125.0F, 33.0F);
     private static final Pose AWAY_A = new Pose(500.5D, 90.0D, 501.5D, 3.0F, 4.0F);
@@ -57,26 +56,28 @@ public final class TpaProbe {
     private static int launchTick = -1;
     private static int startTick;
     private static int phase;
-
+    private static int phaseTick;
     private static EntityPlayerMP playerA;
-    private static EntityPlayerMP playerB;
+    private static EntityPlayerMP[] bots;
     private static UUID idA;
-    private static UUID idB;
+    private static final Map<UUID, String> names = new HashMap<UUID, String>();
     private static long expiryDeadline = -1L;
     private static Pose acceptExpected;
-    private static Pose snapExpected;
-
-    private static final Map<String, Boolean> RESULTS = new LinkedHashMap<String, Boolean>();
-    private static final Map<UUID, Integer> LOG_CURSOR = new HashMap<UUID, Integer>();
-    private static final Map<UUID, String> LAST_TEXT = new HashMap<UUID, String>();
-    private static final Map<UUID, Integer> LAST_TICK = new HashMap<UUID, Integer>();
+    private static Pose expiryA;
+    private static Pose expiryB;
+    private static boolean expiryEarlyTeleport;
+    private static final LinkedHashSet<String> passed = new LinkedHashSet<String>();
+    private static final LinkedHashSet<String> failed = new LinkedHashSet<String>();
+    private static final Map<UUID, List<String>> observed = new HashMap<UUID, List<String>>();
+    private static final Map<UUID, Integer> cursor = new HashMap<UUID, Integer>();
+    private static final Map<UUID, String> lastText = new HashMap<UUID, String>();
+    private static final Map<UUID, Integer> lastTick = new HashMap<UUID, Integer>();
 
     TpaProbe() {
     }
 
     static void bootstrap(Path dir) {
-        gameDir = dir == null ? Paths.get(".").toAbsolutePath().normalize()
-                : dir.toAbsolutePath().normalize();
+        gameDir = dir == null ? Paths.get(".").toAbsolutePath().normalize() : dir.toAbsolutePath().normalize();
         cleanResults();
         try {
             productClass = Class.forName(PRODUCT);
@@ -85,8 +86,8 @@ public final class TpaProbe {
             productPresent = false;
         }
         if (!productPresent) {
-            for (String token : REQUIRED) RESULTS.put(token, Boolean.FALSE);
-            emit("FAIL", "no_product");
+            check(false, "no_product");
+            emit();
         }
     }
 
@@ -97,178 +98,246 @@ public final class TpaProbe {
         }
     }
 
-    // LOWEST: the product's tick handler teleports/expiry-drains before the probe observes.
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase != TickEvent.Phase.END || finished || !productPresent || server == null) return;
         int tick = server.getTickCounter();
         if (launchTick < 0) launchTick = tick;
         watchSpam(tick);
+        if (tick - startTick > TIMEOUT_TICKS && startTick > 0) {
+            check(false, "timeout");
+            emit();
+            return;
+        }
 
         if (playerA == null) {
-            List<EntityPlayerMP> players = server.getPlayerList().getPlayers();
-            if (players != null && !players.isEmpty()) playerA = players.get(0);
-            else if (tick - launchTick >= PLAYER_WAIT_TICKS) playerA = fabricate("TpaProbe_A");
+            if (tick - launchTick < PLAYER_WAIT_TICKS) return;
+            playerA = fabricate("TpaProbe_A");
             if (playerA == null) return;
             idA = playerA.getUniqueID();
-            if (players != null && players.size() > 1 && players.get(1) != playerA) {
-                playerB = players.get(1);
-            } else {
-                playerB = fabricate("TpaProbe_B");
-            }
-            if (playerB == null) {
-                for (String token : REQUIRED) RESULTS.put(token, Boolean.FALSE);
-                emit("FAIL", "no_second_player");
-                return;
-            }
-            idB = playerB.getUniqueID();
-            startTick = tick;
-            phase = 0;
-            System.out.println("[TPA_PROBE] step=players a=" + playerA.getName()
-                    + " b=" + playerB.getName() + " fabricatedB=" + (playerB instanceof ProbePlayer));
-            return;
-        }
-        if (tick - startTick < 2) return;
-        if (tick - startTick > TIMEOUT_TICKS) {
-            emit("FAIL", "timeout_phase_" + phase);
-            return;
-        }
-
-        switch (phase) {
-            case 0:
-                setPose(playerA, START_A);
-                setPose(playerB, START_B);
-                clearLogs();
-                dispatch(playerA, "tpa " + playerB.getName());
-                List<?> created = inbound(idB);
-                TpaRequestView view = created.isEmpty() ? null : new TpaRequestView(created.get(0));
-                check("request_ok", created.size() == 1 && view != null
-                        && "TO_TARGET".equals(view.kind) && idA.equals(view.requester)
-                        && idB.equals(view.target) && count(log(idA)) == 1 && count(log(idB)) == 1);
-                phase++;
-                break;
-            case 1:
-                clearLogs();
-                dispatch(playerA, "tpa " + playerB.getName());
-                check("duplicate_rejected", registrySize() == 1 && count(log(idA)) == 1
-                        && joined(log(idA)).contains("already"));
-                clearLogs();
-                dispatch(playerA, "tpa " + playerA.getName());
-                check("self_rejected", registrySize() == 1 && count(log(idA)) == 1
-                        && joined(log(idA)).contains("yourself"));
-                clearLogs();
-                dispatch(playerA, "tpa NoSuchTpaPlayerXYZ");
-                check("no_such_player", registrySize() == 1 && count(log(idA)) == 1
-                        && joined(log(idA)).contains("No such"));
-                phase++;
-                break;
-            case 2:
-                setPose(playerA, START_A);
-                clearLogs();
-                dispatch(playerB, "tpdeny " + playerA.getName());
-                check("deny_ok", registrySize() == 0 && count(log(idB)) == 1
-                        && matches(pose(playerA), START_A));
-                phase++;
-                break;
-            case 3:
-                // Request first, then move the target: accept must use the LIVE pose.
-                setPose(playerB, START_B);
-                clearLogs();
-                dispatch(playerA, "tpa " + playerB.getName());
-                acceptExpected = LIVE;
-                setPose(playerB, LIVE);
-                phase++;
-                break;
-            case 4:
-                setPose(playerA, AWAY_A);
-                clearLogs();
-                dispatch(playerB, "tpaccept");
-                // Read the pose in the SAME tick: gravity cannot perturb the assertion.
-                check("accept_ok", matches(pose(playerA), acceptExpected) && registrySize() == 0
-                        && count(log(idB)) == 1);
-                phase++;
-                break;
-            case 5:
-                setPose(playerA, SNAP);
-                clearLogs();
-                dispatch(playerA, "tpahere " + playerB.getName());
-                List<?> here = inbound(idB);
-                TpaRequestView hereView = here.isEmpty() ? null : new TpaRequestView(here.get(0));
-                snapExpected = SNAP;
-                boolean snapOk = hereView != null && "TO_REQUESTER".equals(hereView.kind)
-                        && hereView.snapshot != null && hereView.snapshot.matches(SNAP);
-                check("tpahere_ok", snapOk);
-                // The requester moves after creation: accept must use the snapshot.
-                setPose(playerA, AWAY_A);
-                phase++;
-                break;
-            case 6:
-                setPose(playerB, AWAY_B);
-                clearLogs();
-                dispatch(playerB, "tpaccept");
-                check("tpahere_ok", RESULTS.get("tpahere_ok").booleanValue()
-                        && matches(pose(playerB), snapExpected) && matches(pose(playerA), AWAY_A)
-                        && registrySize() == 0);
-                phase++;
-                break;
-            case 7:
-                clearLogs();
-                dispatch(playerA, "tpa " + playerB.getName());
-                boolean createdForCancel = registrySize() == 1;
-                dispatch(playerA, "tpacancel " + playerB.getName());
-                check("cancel_ok", createdForCancel && registrySize() == 0
-                        && count(log(idA)) == 1 && joined(log(idA)).contains("Cancelled"));
-                phase++;
-                break;
-            case 8:
-                clearLogs();
-                dispatch(playerA, "tpa " + playerB.getName());
-                List<?> pending = inbound(idB);
-                if (pending.isEmpty()) {
-                    check("expiry_ok", false);
-                    phase = 10;
-                } else {
-                    expiryDeadline = new TpaRequestView(pending.get(0)).deadlineTick;
-                    setPose(playerA, AWAY_A);
-                    setPose(playerB, AWAY_B);
-                    System.out.println("[TPA_PROBE] step=expiry_start deadline=" + expiryDeadline);
-                    phase++;
+            pin(playerA);
+            registerHook(playerA);
+            bots = new EntityPlayerMP[BOT_COUNT];
+            for (int i = 0; i < bots.length; i++) {
+                bots[i] = fabricate("TpaProbe_Bot" + i);
+                if (bots[i] == null) {
+                    check(false, "fabrication_failed");
+                    emit();
+                    return;
                 }
-                break;
-            case 9:
-                Long now = callLong("tick");
-                if (now == null || now.longValue() <= expiryDeadline + 2L) return;
-                check("expiry_ok", registrySize() == 0
-                        && matches(pose(playerA), AWAY_A) && matches(pose(playerB), AWAY_B)
-                        && joined(log(idA)).contains("expired") && joined(log(idB)).contains("expired"));
-                phase++;
-                break;
-            case 10:
-                check("no_spam", !spam);
-                emit(pass() ? "PASS" : "FAIL", null);
-                break;
-            default:
-                emit("FAIL", "bad_phase_" + phase);
+                pin(bots[i]);
+                registerHook(bots[i]);
+                clearChat(bots[i].getUniqueID());
+            }
+            clearChat(idA);
+            ensureConfig();
+            startTick = tick;
+            phaseTick = tick;
+            phase = 0;
+            System.out.println("[TPA_PROBE] step=players a=" + profileName(playerA) + " bots=" + bots.length);
+            return;
+        }
+        if (tick - phaseTick < 2) return;
+        try {
+            step();
+        } catch (Throwable error) {
+            System.out.println("[TPA_PROBE] step_error phase=" + phase + " error=" + error);
+            failed.add("phase_" + phase + "_exception");
+            emit();
         }
     }
 
-    // ---------- real dispatcher ----------
+    private static void step() {
+        switch (phase) {
+            case 0:
+                setPose(playerA, new Pose(100.5D, 64.0D, 100.5D, 10.0F, 20.0F));
+                setPose(bots[0], new Pose(200.5D, 64.0D, 200.5D, 30.0F, 40.0F));
+                clearChat(idA);
+                int rc0 = dispatch(playerA, "tpa " + name(0));
+                List<?> created = inbound(bots[0].getUniqueID());
+                RequestView view = created.isEmpty() ? null : new RequestView(created.get(0));
+                check(rc0 > 0 && created.size() == 1 && view != null && "TO_TARGET".equals(view.kind)
+                        && idA.equals(view.requester) && bots[0].getUniqueID().equals(view.target)
+                        && chatCount(idA) == 1 && chatCount(bots[0].getUniqueID()) == 1, "request_ok");
+                break;
+            case 1:
+                clearChat(idA);
+                dispatch(playerA, "tpa " + name(0));
+                check(registrySize() == 1 && chatCount(idA) == 1 && text(idA).contains("already"), "duplicate_rejected");
+                clearChat(idA);
+                dispatch(playerA, "tpa " + profileName(playerA));
+                check(registrySize() == 1 && chatCount(idA) == 1 && text(idA).contains("yourself"), "self_rejected");
+                clearChat(idA);
+                dispatch(playerA, "tpa NoSuchTpaPlayerXYZ");
+                check(registrySize() == 1 && chatCount(idA) == 1 && text(idA).contains("no such"), "no_such_player");
+                break;
+            case 2:
+                setPose(playerA, new Pose(100.5D, 64.0D, 100.5D, 10.0F, 20.0F));
+                clearChat(idA);
+                int rc2 = dispatch(bots[0], "tpdeny " + profileName(playerA));
+                check(rc2 > 0 && registrySize() == 0 && chatCount(idA) == 1, "deny_ok");
+                break;
+            case 3:
+                setPose(bots[0], LIVE);
+                dispatch(playerA, "tpa " + name(0));
+                acceptExpected = LIVE;
+                setPose(playerA, AWAY_A);
+                break;
+            case 4:
+                int rc4 = dispatch(bots[0], "tpaccept");
+                check(rc4 > 0 && matches(pose(playerA), acceptExpected) && registrySize() == 0, "accept_ok");
+                break;
+            case 5:
+                setPose(playerA, SNAP);
+                dispatch(playerA, "tpahere " + name(0));
+                List<?> here = inbound(bots[0].getUniqueID());
+                RequestView hereView = here.isEmpty() ? null : new RequestView(here.get(0));
+                boolean snapOk = hereView != null && "TO_REQUESTER".equals(hereView.kind)
+                        && hereView.snapshot != null && hereView.snapshot.matches(SNAP);
+                check(snapOk, "snapshot_ok");
+                setPose(playerA, AWAY_A);
+                break;
+            case 6:
+                setPose(bots[0], AWAY_B);
+                int rc6 = dispatch(bots[0], "tpaccept");
+                check(rc6 > 0 && matches(pose(bots[0]), SNAP) && matches(pose(playerA), AWAY_A)
+                        && registrySize() == 0, "tpahere_ok");
+                break;
+            case 7:
+                Pose before = pose(playerA);
+                dispatch(playerA, "tpa " + name(0));
+                boolean createdForCancel = registrySize() == 1;
+                clearChat(idA);
+                int rc7 = dispatch(playerA, "tpacancel " + name(0));
+                check(createdForCancel && rc7 > 0 && registrySize() == 0
+                        && matches(pose(playerA), before) && chatCount(idA) == 1
+                        && text(idA).contains("cancel"), "cancel_ok");
+                break;
+            case 8:
+                for (int i = 0; i < bots.length; i++) dispatch(playerA, "tpa " + name(i));
+                List<?> outgoing = outgoing(idA);
+                boolean oldestEvicted = true;
+                boolean newestPresent = false;
+                if (outgoing == null) oldestEvicted = false;
+                else {
+                    for (Object request : outgoing) {
+                        Object target = field(request, "target");
+                        if (bots[0].getUniqueID().equals(target)) oldestEvicted = false;
+                        if (bots[bots.length - 1].getUniqueID().equals(target)) newestPresent = true;
+                    }
+                }
+                check(outgoing != null && outgoing.size() == 5 && oldestEvicted && newestPresent, "outgoing_limit");
+                break;
+            case 9:
+                clearChat(idA);
+                int rc9 = dispatch(playerA, "tpacancelall");
+                check(rc9 > 0 && outgoing(idA).isEmpty(), "cancelall_ok");
+                dispatch(playerA, "tpa " + name(0));
+                Object expiring = singleOutbound(idA);
+                expiryDeadline = expiring == null ? -1L : new RequestView(expiring).deadlineTick;
+                expiryA = pose(playerA);
+                expiryB = pose(bots[0]);
+                expiryEarlyTeleport = false;
+                clearChat(idA);
+                clearChat(bots[0].getUniqueID());
+                System.out.println("[TPA_PROBE] step=expiry_start deadline=" + expiryDeadline);
+                break;
+            case 10:
+                Long now = callLong("tick");
+                if (expiryDeadline <= 0L || now == null || now.longValue() < expiryDeadline + 2L) {
+                    if (!matches(pose(playerA), expiryA) || !matches(pose(bots[0]), expiryB)) {
+                        expiryEarlyTeleport = true;
+                    }
+                    return;
+                }
+                check(registrySize() == 0 && !expiryEarlyTeleport && matches(pose(playerA), expiryA)
+                        && matches(pose(bots[0]), expiryB) && text(idA).contains("expired")
+                        && text(bots[0].getUniqueID()).contains("expired"), "expiry_ok");
+                break;
+            default:
+                check(!spam, "no_spam");
+                emit();
+                return;
+        }
+        phase++;
+        phaseTick = server.getTickCounter();
+    }
+
+    // ---------------- real dispatcher ----------------
 
     private static int dispatch(EntityPlayerMP sender, String command) {
-        List<EntityPlayerMP> players = server.getPlayerList().getPlayers();
-        boolean added = !players.contains(sender);
-        if (added) players.add(sender);
         try {
             return server.getCommandManager().executeCommand(sender, "/" + command);
         } catch (Throwable error) {
             System.out.println("[TPA_PROBE] dispatch_failed cmd=" + command + " error=" + error);
-            return 0;
-        } finally {
-            if (added) players.remove(sender);
+            return -1;
         }
     }
 
-    // ---------- reflective product observation ----------
+    // ---------------- stable fabricated players ----------------
+
+    private static EntityPlayerMP fabricate(String name) {
+        try {
+            WorldServer world = server.getWorld(0);
+            if (world == null) return null;
+            GameProfile profile = new GameProfile(UUID.randomUUID(), name);
+            names.put(profile.getId(), name);
+            ProbePlayer player = new ProbePlayer(server, world, profile, new PlayerInteractionManager(world));
+            player.dimension = 0;
+            player.setPositionAndRotation(10.5D, 64.0D, 10.5D, 0.0F, 0.0F);
+            return player;
+        } catch (Throwable error) {
+            System.out.println("[TPA_PROBE] fabricate_failed name=" + name + " error=" + error);
+            return null;
+        }
+    }
+
+    private static void registerHook(EntityPlayerMP player) {
+        if (player == null || productClass == null) return;
+        try {
+            for (Method method : productClass.getMethods()) {
+                if ("registerTestPlayer".equals(method.getName()) && method.getParameterTypes().length == 1) {
+                    method.invoke(null, player);
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Older product builds resolve only real server players.
+        }
+    }
+
+    /** Profile names read from the authlib GameProfile, discovered by return type. */
+    private static String profileName(EntityPlayerMP player) {
+        if (player == null) return null;
+        String stored = names.get(player.getUniqueID());
+        if (stored != null) return stored;
+        try {
+            for (Class<?> type = player.getClass(); type != null; type = type.getSuperclass()) {
+                for (Method method : type.getDeclaredMethods()) {
+                    if (method.getParameterTypes().length != 0) continue;
+                    if (!method.getReturnType().getName().endsWith("GameProfile")) continue;
+                    method.setAccessible(true);
+                    Object profile = method.invoke(player);
+                    if (profile == null) continue;
+                    Object value = profile.getClass().getMethod("getName").invoke(profile);
+                    if (value instanceof String) return (String) value;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Fall through to the mapped accessor.
+        }
+        try {
+            return player.getName();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String name(int index) {
+        return profileName(bots[index]);
+    }
+
+    // ---------------- reflective product observation ----------------
 
     private static Object call(String name, Class<?>[] types, Object... args) {
         try {
@@ -299,205 +368,207 @@ public final class TpaProbe {
     }
 
     @SuppressWarnings("unchecked")
-    private static List<?> inbound(UUID target) {
+    private static List<Object> inbound(UUID target) {
         Object reg = registry();
         if (reg == null) return Collections.emptyList();
         try {
             Object result = reg.getClass().getMethod("inbound", UUID.class).invoke(reg, target);
-            return result instanceof List<?> ? (List<?>) result : Collections.emptyList();
+            return result instanceof List ? (List<Object>) result : Collections.emptyList();
         } catch (Throwable ignored) {
             return Collections.emptyList();
         }
     }
 
     @SuppressWarnings("unchecked")
-    private static List<String> log(UUID player) {
-        Object value = call("chatLog", new Class<?>[] { UUID.class }, player);
-        if (value instanceof List<?>) {
-            List<String> copy = new ArrayList<String>();
-            for (Object item : (List<?>) value) copy.add(String.valueOf(item));
-            return copy;
+    private static List<Object> outgoing(UUID requester) {
+        Object reg = registry();
+        if (reg == null) return Collections.emptyList();
+        try {
+            Object result = reg.getClass().getMethod("outgoing", UUID.class).invoke(reg, requester);
+            return result instanceof List ? (List<Object>) result : Collections.emptyList();
+        } catch (Throwable ignored) {
+            return Collections.emptyList();
         }
-        return Collections.emptyList();
     }
 
-    private static void clearLogs() {
-        call("clearChatLog", new Class<?>[] { UUID.class }, idA);
-        call("clearChatLog", new Class<?>[] { UUID.class }, idB);
-        LOG_CURSOR.put(idA, Integer.valueOf(0));
-        LOG_CURSOR.put(idB, Integer.valueOf(0));
+    private static Object singleOutbound(UUID id) {
+        List<Object> list = outgoing(id);
+        return list.isEmpty() ? null : list.get(0);
     }
 
-    private static int count(List<String> messages) {
-        return messages == null ? 0 : messages.size();
+    @SuppressWarnings("unchecked")
+    private static List<String> chatLog(UUID player) {
+        Object value = call("chatLog", new Class<?>[] { UUID.class }, player);
+        return value instanceof List ? (List<String>) value : Collections.emptyList();
     }
 
-    private static String joined(List<String> messages) {
+    private static int chatCount(UUID player) {
+        return chatLog(player).size();
+    }
+
+    private static void clearChat(UUID player) {
+        if (player == null) return;
+        List<String> seen = observed.get(player);
+        if (seen == null) {
+            seen = new ArrayList<String>();
+            observed.put(player, seen);
+        }
+        seen.addAll(chatLog(player));
+        call("clearChatLog", new Class<?>[] { UUID.class }, player);
+    }
+
+    private static String text(UUID player) {
         StringBuilder sb = new StringBuilder();
-        if (messages != null) for (String message : messages) sb.append(message).append('|');
-        return sb.toString();
+        for (String line : chatLog(player)) sb.append(line).append('|');
+        return sb.toString().toLowerCase(Locale.ROOT);
     }
 
     private static void watchSpam(int tick) {
-        if (idA == null || idB == null) return;
+        if (idA == null) return;
         watchOne(idA, tick);
-        watchOne(idB, tick);
+        if (bots == null) return;
+        for (EntityPlayerMP bot : bots) {
+            if (bot != null) watchOne(bot.getUniqueID(), tick);
+        }
     }
 
     private static void watchOne(UUID uuid, int tick) {
-        List<String> current = log(uuid);
-        Integer cursor = LOG_CURSOR.get(uuid);
-        int from = cursor == null ? 0 : cursor.intValue();
+        List<String> current = chatLog(uuid);
+        Integer at = cursor.get(uuid);
+        int from = at == null ? 0 : at.intValue();
         if (current.size() < from) from = 0;
         for (int i = from; i < current.size(); i++) {
-            String text = current.get(i);
-            String previous = LAST_TEXT.get(uuid);
-            Integer previousTick = LAST_TICK.get(uuid);
-            if (text.equals(previous) && previousTick != null && tick - previousTick.intValue() <= 1) {
-                spam = true;
-            }
-            LAST_TEXT.put(uuid, text);
-            LAST_TICK.put(uuid, Integer.valueOf(tick));
+            String message = current.get(i);
+            String previous = lastText.get(uuid);
+            Integer previousTick = lastTick.get(uuid);
+            if (message.equals(previous) && previousTick != null && tick - previousTick.intValue() <= 1) spam = true;
+            lastText.put(uuid, message);
+            lastTick.put(uuid, Integer.valueOf(tick));
         }
-        LOG_CURSOR.put(uuid, Integer.valueOf(current.size()));
+        cursor.put(uuid, Integer.valueOf(current.size()));
     }
 
-    /** Read-only view of a TpaRequest field set, immune to the core class being absent. */
-    private static final class TpaRequestView {
-        final long id;
+    private static void ensureConfig() {
+        try {
+            Object config = call("config", new Class<?>[0]);
+            if (config == null) return;
+            Field field = config.getClass().getField("expirySeconds");
+            Object current = field.get(config);
+            if (current instanceof Integer && ((Integer) current).intValue() > 10) field.set(config, Integer.valueOf(2));
+            field = config.getClass().getField("maxOutgoing");
+            current = field.get(config);
+            if (current instanceof Integer && ((Integer) current).intValue() != 5) field.set(config, Integer.valueOf(5));
+        } catch (Throwable ignored) {
+            // Defaults apply.
+        }
+    }
+
+    private static Object field(Object target, String name) {
+        if (target == null) return null;
+        try {
+            return target.getClass().getField(name).get(target);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static final class RequestView {
         final UUID requester;
         final UUID target;
         final String kind;
         final Pose snapshot;
         final long deadlineTick;
 
-        TpaRequestView(Object request) {
-            id = fieldLong(request, "id");
+        RequestView(Object request) {
             requester = (UUID) field(request, "requester");
             target = (UUID) field(request, "target");
             Object kindValue = field(request, "kind");
             kind = kindValue == null ? "" : kindValue.toString();
-            Object pose = field(request, "snapshot");
-            snapshot = pose == null ? null : new Pose(
-                    fieldDouble(pose, "x"), fieldDouble(pose, "y"), fieldDouble(pose, "z"),
-                    (float) fieldDouble(pose, "yaw"), (float) fieldDouble(pose, "pitch"));
-            deadlineTick = fieldLong(request, "deadlineTick");
+            Object poseValue = field(request, "snapshot");
+            snapshot = poseValue == null ? null : new Pose(
+                    doubleField(poseValue, "x"), doubleField(poseValue, "y"), doubleField(poseValue, "z"),
+                    (float) doubleField(poseValue, "yaw"), (float) doubleField(poseValue, "pitch"));
+            Object deadline = field(request, "deadlineTick");
+            deadlineTick = deadline instanceof Number ? ((Number) deadline).longValue() : -1L;
         }
     }
 
-    private static Object field(Object object, String name) {
-        try {
-            return object.getClass().getField(name).get(object);
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
-
-    private static long fieldLong(Object object, String name) {
-        Object value = field(object, name);
-        return value instanceof Number ? ((Number) value).longValue() : -1L;
-    }
-
-    private static double fieldDouble(Object object, String name) {
-        Object value = field(object, name);
+    private static double doubleField(Object target, String name) {
+        Object value = field(target, name);
         return value instanceof Number ? ((Number) value).doubleValue() : Double.NaN;
     }
 
-    // ---------- pose helpers ----------
+    // ---------------- pose helpers ----------------
 
     private static Pose pose(EntityPlayerMP player) {
         return new Pose(player.posX, player.posY, player.posZ, player.rotationYaw, player.rotationPitch);
     }
 
+    private static void pin(EntityPlayerMP player) {
+        try {
+            player.setNoGravity(true);
+            player.motionX = 0.0D;
+            player.motionY = 0.0D;
+            player.motionZ = 0.0D;
+        } catch (Throwable ignored) {
+            // Fabricated players still hold their pose.
+        }
+    }
+
     private static void setPose(EntityPlayerMP player, Pose pose) {
-        player.setPositionAndRotation(pose.x, pose.y, pose.z, pose.yaw, pose.pitch);
+        player.setPositionAndRotation(pose.x, pose.y, pose.z, (float) pose.yaw, (float) pose.pitch);
     }
 
     private static boolean matches(Pose a, Pose b) {
-        return a != null && b != null
-                && Math.abs(a.x - b.x) <= TOL && Math.abs(a.y - b.y) <= TOL
+        return a != null && b != null && Math.abs(a.x - b.x) <= TOL && Math.abs(a.y - b.y) <= TOL
                 && Math.abs(a.z - b.z) <= TOL && Math.abs(a.yaw - b.yaw) <= TOL
                 && Math.abs(a.pitch - b.pitch) <= TOL;
     }
 
-    // ---------- fabrication (1.12.2 reference pattern) ----------
-
-    private static EntityPlayerMP fabricate(String name) {
-        try {
-            WorldServer world = server.getWorld(0);
-            if (world == null) return null;
-            GameProfile profile = new GameProfile(UUID.randomUUID(), name);
-            ProbePlayer player = new ProbePlayer(server, world, profile);
-            player.dimension = 0;
-            player.setPositionAndRotation(100.5D, 64.0D, 100.5D, 0.0F, 0.0F);
-            return player;
-        } catch (Throwable error) {
-            System.out.println("[TPA_PROBE] fabricate_failed error=" + error);
-            return null;
-        }
-    }
-
-    /** No network connection: messages are captured by the product's chat sink. */
     private static final class ProbePlayer extends EntityPlayerMP {
-        ProbePlayer(MinecraftServer minecraftServer, WorldServer world, GameProfile profile) {
-            super(minecraftServer, world, profile, new PlayerInteractionManager(world));
+        ProbePlayer(MinecraftServer server, WorldServer world, GameProfile profile, PlayerInteractionManager manager) {
+            super(server, world, profile, manager);
         }
 
         @Override
         public void sendMessage(ITextComponent component) {
-            // Recorded by Tpa.chat(); no connection to send packets to.
         }
 
         @Override
         public void sendStatusMessage(ITextComponent component, boolean actionBar) {
-            // Recorded by Tpa.chat() where applicable.
         }
     }
 
-    // ---------- result: exactly one canonical line ----------
+    // ---------------- result ----------------
 
-    private static void check(String token, boolean ok) {
-        RESULTS.put(token, Boolean.valueOf(ok));
-        if (!ok) System.out.println("[TPA_PROBE] check_failed " + token);
-    }
-
-    private static boolean pass() {
-        if (RESULTS.size() < REQUIRED.length) return false;
-        for (String token : REQUIRED) {
-            Boolean value = RESULTS.get(token);
-            if (value == null || !value.booleanValue()) return false;
+    private static void check(boolean ok, String token) {
+        if (ok) passed.add(token);
+        else {
+            failed.add(token);
+            System.out.println("[TPA_PROBE] check_failed " + token);
         }
-        return true;
     }
 
-    private static synchronized void emit(String verdict, String reason) {
+    private static synchronized void emit() {
         if (finished) return;
         finished = true;
+        boolean complete = failed.isEmpty();
+        for (String token : REQUIRED) if (!passed.contains(token)) complete = false;
+        String verdict = complete ? "PASS" : "FAIL";
         StringBuilder line = new StringBuilder(PREFIX).append(' ').append(verdict)
-                .append(" product=").append(productPresent);
-        if (reason != null) line.append(" reason=").append(reason);
-        List<String> failed = new ArrayList<String>();
+                .append(" product=").append(productPresent)
+                .append(" checks=").append(passed.size() + failed.size())
+                .append(" failures=").append(failed.size());
+        if (!failed.isEmpty()) line.append(" reason=").append(String.join(",", failed));
         for (String token : REQUIRED) {
-            Boolean value = RESULTS.get(token);
-            String state = value == null ? "skipped" : (value.booleanValue() ? "ok" : "fail");
+            Boolean ok = passed.contains(token) ? Boolean.TRUE : (failed.contains(token) ? Boolean.FALSE : null);
+            String state = ok == null ? "skipped" : (ok.booleanValue() ? "ok" : "fail");
             line.append(' ').append(token).append('=').append(state);
-            if (!"ok".equals(state)) failed.add(token);
-            else line.append(' ').append(token);
+            if (ok != null && ok.booleanValue()) line.append(' ').append(token);
         }
-        if (!failed.isEmpty()) line.append(" failed=").append(join(failed));
-        if (!productPresent) line.append(" limit_rejected");
         String result = line.toString();
         write(result);
         System.out.println("[TPA_PROBE] " + result);
-    }
-
-    private static String join(List<String> values) {
-        StringBuilder sb = new StringBuilder();
-        for (String value : values) {
-            if (sb.length() > 0) sb.append(',');
-            sb.append(value);
-        }
-        return sb.toString();
     }
 
     private static void write(String line) {
@@ -522,8 +593,8 @@ public final class TpaProbe {
     }
 
     private static void cleanResults() {
-        Path cwd = Paths.get("").toAbsolutePath().normalize();
         Set<Path> targets = new LinkedHashSet<Path>();
+        Path cwd = Paths.get("").toAbsolutePath().normalize();
         targets.add(cwd.resolve("tpa-result.txt"));
         targets.add(cwd.resolve("run").resolve("tpa-result.txt"));
         if (gameDir != null) {
@@ -555,8 +626,7 @@ public final class TpaProbe {
         }
 
         boolean matches(Pose other) {
-            return other != null
-                    && Math.abs(x - other.x) <= TOL && Math.abs(y - other.y) <= TOL
+            return other != null && Math.abs(x - other.x) <= TOL && Math.abs(y - other.y) <= TOL
                     && Math.abs(z - other.z) <= TOL && Math.abs(yaw - other.yaw) <= TOL
                     && Math.abs(pitch - other.pitch) <= TOL;
         }

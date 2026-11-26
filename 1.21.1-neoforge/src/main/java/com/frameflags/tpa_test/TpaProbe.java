@@ -1,10 +1,7 @@
 package com.frameflags.tpa_test;
 
 import com.mojang.authlib.GameProfile;
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.lang.reflect.ParameterizedType;
-import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,13 +19,13 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.server.players.PlayerList;
 import net.minecraft.world.entity.RelativeMovement;
 import net.minecraft.world.phys.Vec3;
 
 /**
  * In-game TPA probe. Every state change goes through the real Brigadier dispatcher as a
- * real ServerPlayer or a fabricated ServerPlayer. Product classes are touched only by
+ * real ServerPlayer or a fabricated ServerPlayer registered through the product's
+ * probe-only hook (never into PlayerList). Product classes are touched only by
  * reflection, so this jar also loads for the negative control (product jar absent).
  * A skipped check is never recorded as a pass.
  */
@@ -186,13 +183,13 @@ public final class TpaProbe {
     private static void phaseValidation() {
         clearChat(joinedId);
 
-        int rc = dispatch(joined, "tpa " + bots[0].getGameProfile().getName());
+        int rc = dispatch(joined, "tpa " + profileName(bots[0]));
         List<?> inbound = inbound(bots[0].getUUID());
         check(rc > 0 && inbound != null && inbound.size() == 1 && chatCount(joinedId) == 1, "request_ok");
 
         clearChat(joinedId);
         int size = registrySize();
-        rc = dispatch(joined, "tpa " + joined.getGameProfile().getName());
+        rc = dispatch(joined, "tpa " + profileName(joined));
         check(rc == 0 && registrySize() == size && chatCount(joinedId) == 1, "self_rejected");
 
         clearChat(joinedId);
@@ -200,7 +197,7 @@ public final class TpaProbe {
         check(rc == 0 && registrySize() == size && chatCount(joinedId) == 1, "no_such_player");
 
         clearChat(joinedId);
-        rc = dispatch(joined, "tpa " + bots[0].getGameProfile().getName());
+        rc = dispatch(joined, "tpa " + profileName(bots[0]));
         check(rc == 0 && registrySize() == size && chatCount(joinedId) == 1, "duplicate_rejected");
     }
 
@@ -218,7 +215,7 @@ public final class TpaProbe {
 
     private static void phaseHere() {
         setPose(joined, 300.5D, 80.5D, 300.5D, 120.0F, -30.0F);
-        int rc = dispatch(joined, "tpahere " + bots[0].getGameProfile().getName());
+        int rc = dispatch(joined, "tpahere " + profileName(bots[0]));
         setPose(joined, 600.5D, 130.5D, 600.5D, 0.0F, 0.0F);
         clearChat(bots[0].getUUID());
         int rc2 = dispatch(bots[0], "tpaccept");
@@ -231,7 +228,7 @@ public final class TpaProbe {
     private static void phaseDeny() {
         setPose(joined, 700.5D, 90.5D, 700.5D, 45.0F, 5.0F);
         Pose before = pose(joined);
-        int rc = dispatch(joined, "tpa " + bots[0].getGameProfile().getName());
+        int rc = dispatch(joined, "tpa " + profileName(bots[0]));
         clearChat(joinedId);
         int rc2 = dispatch(bots[0], "tpdeny");
         List<?> inbound = inbound(bots[0].getUUID());
@@ -241,7 +238,7 @@ public final class TpaProbe {
 
     private static void phaseCancel() {
         Pose before = pose(joined);
-        int rc = dispatch(joined, "tpa " + bots[0].getGameProfile().getName());
+        int rc = dispatch(joined, "tpa " + profileName(bots[0]));
         clearChat(joinedId);
         int rc2 = dispatch(joined, "tpacancel");
         List<?> outgoing = outgoing(joinedId);
@@ -251,7 +248,7 @@ public final class TpaProbe {
 
     private static void phaseLimit() {
         for (ServerPlayer bot : bots) {
-            dispatch(joined, "tpa " + bot.getGameProfile().getName());
+            dispatch(joined, "tpa " + profileName(bot));
         }
         List<?> outgoing = outgoing(joinedId);
         boolean evicted = false;
@@ -274,7 +271,7 @@ public final class TpaProbe {
 
     private static void phaseExpiryStart() {
         expiryPose = pose(joined);
-        int rc = dispatch(joined, "tpa " + bots[0].getGameProfile().getName());
+        int rc = dispatch(joined, "tpa " + profileName(bots[0]));
         expiryRequested = rc > 0;
         expiryStart = server.getTickCount();
         expiryEarlyTeleport = false;
@@ -336,6 +333,44 @@ public final class TpaProbe {
         }
     }
 
+    private static boolean registerTestPlayer(ServerPlayer player) {
+        if (productClass == null) return false;
+        try {
+            Object result = productClass.getMethod("registerTestPlayer", ServerPlayer.class).invoke(null, player);
+            return Boolean.TRUE.equals(result);
+        } catch (ReflectiveOperationException | RuntimeException t) {
+            System.out.println("[TPA_PROBE] registerTestPlayer failed: " + t);
+            return false;
+        }
+    }
+
+    private static boolean unregisterTestPlayers() {
+        if (productClass == null) return true;
+        try {
+            productClass.getMethod("unregisterTestPlayers").invoke(null);
+            return true;
+        } catch (ReflectiveOperationException | RuntimeException t) {
+            System.out.println("[TPA_PROBE] unregisterTestPlayers failed: " + t);
+            return false;
+        }
+    }
+
+    /** Authlib profile name via reflection: getName() here, name() in newer libraries. */
+    private static String profileName(ServerPlayer player) {
+        if (player == null) return null;
+        Object profile = player.getGameProfile();
+        if (profile == null) return null;
+        for (String accessor : new String[] { "getName", "name" }) {
+            try {
+                Object value = profile.getClass().getMethod(accessor).invoke(profile);
+                if (value instanceof String && !((String) value).isEmpty()) return (String) value;
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                // Try the other accessor name.
+            }
+        }
+        return null;
+    }
+
     // ---------------- fake player ----------------
 
     private static ServerPlayer fabricate(MinecraftServer minecraftServer, String name) {
@@ -344,61 +379,14 @@ public final class TpaProbe {
             GameProfile profile = new GameProfile(UUID.randomUUID(), name);
             ProbePlayer fake = new ProbePlayer(minecraftServer, level, profile);
             setPose(fake, 10.5D, 64.5D, 10.5D, 0.0F, 0.0F);
-            register(fake, minecraftServer.getPlayerList());
+            if (!registerTestPlayer(fake)) {
+                System.out.println("[TPA_PROBE] register_test_player_failed name=" + name);
+                return null;
+            }
             return fake;
         } catch (Throwable t) {
             System.out.println("[TPA_PROBE] fabricate_failed name=" + name + " error=" + t);
             return null;
-        }
-    }
-
-    /** Registers into PlayerList collections by generic type (survives Fabric remapping). */
-    @SuppressWarnings("unchecked")
-    private static void register(ServerPlayer fake, PlayerList list) throws Exception {
-        boolean inList = false;
-        boolean inMap = false;
-        for (Field field : PlayerList.class.getDeclaredFields()) {
-            Type generic = field.getGenericType();
-            if (!(generic instanceof ParameterizedType)) continue;
-            Type[] args = ((ParameterizedType) generic).getActualTypeArguments();
-            field.setAccessible(true);
-            if (List.class.isAssignableFrom(field.getType()) && args.length == 1 && args[0] == ServerPlayer.class) {
-                List<ServerPlayer> players = (List<ServerPlayer>) field.get(list);
-                if (!players.contains(fake)) players.add(fake);
-                inList = true;
-            } else if (Map.class.isAssignableFrom(field.getType()) && args.length == 2
-                    && args[0] == UUID.class && args[1] == ServerPlayer.class) {
-                Map<UUID, ServerPlayer> byUuid = (Map<UUID, ServerPlayer>) field.get(list);
-                byUuid.put(fake.getUUID(), fake);
-                inMap = true;
-            }
-        }
-        if (!inList || !inMap) {
-            throw new IllegalStateException("player collections not found list=" + inList + " map=" + inMap);
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private static void unregisterFakes() {
-        if (bots == null || server == null) return;
-        try {
-            PlayerList list = server.getPlayerList();
-            for (Field field : PlayerList.class.getDeclaredFields()) {
-                Type generic = field.getGenericType();
-                if (!(generic instanceof ParameterizedType)) continue;
-                Type[] args = ((ParameterizedType) generic).getActualTypeArguments();
-                field.setAccessible(true);
-                if (List.class.isAssignableFrom(field.getType()) && args.length == 1 && args[0] == ServerPlayer.class) {
-                    List<ServerPlayer> players = (List<ServerPlayer>) field.get(list);
-                    for (ServerPlayer bot : bots) if (bot != null) players.remove(bot);
-                } else if (Map.class.isAssignableFrom(field.getType()) && args.length == 2
-                        && args[0] == UUID.class && args[1] == ServerPlayer.class) {
-                    Map<UUID, ServerPlayer> byUuid = (Map<UUID, ServerPlayer>) field.get(list);
-                    for (ServerPlayer bot : bots) if (bot != null) byUuid.remove(bot.getUUID());
-                }
-            }
-        } catch (Throwable ignored) {
-            // Best effort: the server is shutting down anyway.
         }
     }
 
@@ -565,7 +553,7 @@ public final class TpaProbe {
     private static synchronized void finish() {
         if (finished) return;
         finished = true;
-        unregisterFakes();
+        if (!unregisterTestPlayers()) check(false, "cleanup_failed");
         boolean pass = failed.isEmpty() && passed.size() >= 12;
         String verdict = pass ? "PASS" : "FAIL";
         StringBuilder line = new StringBuilder("TPA_TEST_RESULT: ").append(verdict)

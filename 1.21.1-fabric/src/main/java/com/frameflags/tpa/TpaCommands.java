@@ -67,7 +67,7 @@ public final class TpaCommands {
             return 0;
         }
         ServerPlayer player = (ServerPlayer) source.getEntity();
-        if (server.getPlayerList().getPlayers().size() <= 1) {
+        if (Tpa.onlinePlayerCount(server) <= 1) {
             return fail(player, server, "No other players online.");
         }
         String name = StringArgumentType.getString(context, "target");
@@ -114,7 +114,7 @@ public final class TpaCommands {
             return 0;
         }
         ServerPlayer player = (ServerPlayer) source.getEntity();
-        if (server.getPlayerList().getPlayers().size() <= 1) {
+        if (Tpa.onlinePlayerCount(server) <= 1) {
             return fail(player, server, "No other players online.");
         }
         List<TpaRequest> selected = select(Tpa.registry().inbound(player.getUUID()), who, server, true);
@@ -125,7 +125,7 @@ public final class TpaCommands {
         String lastCounterpart = "";
         for (TpaRequest request : selected) {
             if (Tpa.registry().remove(request.id) == null) continue;
-            ServerPlayer requester = server.getPlayerList().getPlayer(request.requester);
+            ServerPlayer requester = Tpa.resolvePlayer(server, request.requester);
             String requesterName = nameOf(server, request.requester);
             lastCounterpart = requesterName;
             if (request.isHere()) {
@@ -133,7 +133,7 @@ public final class TpaCommands {
                 Tpa.notify(requester, ChatFormatting.GREEN + player.getGameProfile().getName()
                         + " accepted your teleport request.", tick);
             } else {
-                ServerPlayer target = server.getPlayerList().getPlayer(request.target);
+                ServerPlayer target = Tpa.resolvePlayer(server, request.target);
                 if (target == null) {
                     Tpa.notify(player, ChatFormatting.RED + requesterName + " is no longer online.", tick);
                     done++;
@@ -160,7 +160,7 @@ public final class TpaCommands {
             return 0;
         }
         ServerPlayer player = (ServerPlayer) source.getEntity();
-        if (server.getPlayerList().getPlayers().size() <= 1) {
+        if (Tpa.onlinePlayerCount(server) <= 1) {
             return fail(player, server, "No other players online.");
         }
         List<TpaRequest> selected = select(Tpa.registry().inbound(player.getUUID()), who, server, true);
@@ -173,7 +173,7 @@ public final class TpaCommands {
             if (Tpa.registry().remove(request.id) == null) continue;
             String requesterName = nameOf(server, request.requester);
             lastCounterpart = requesterName;
-            Tpa.notify(server.getPlayerList().getPlayer(request.requester),
+            Tpa.notify(Tpa.resolvePlayer(server, request.requester),
                     ChatFormatting.RED + player.getGameProfile().getName() + " denied your teleport request.", tick);
             done++;
         }
@@ -193,7 +193,7 @@ public final class TpaCommands {
             return 0;
         }
         ServerPlayer player = (ServerPlayer) source.getEntity();
-        if (server.getPlayerList().getPlayers().size() <= 1) {
+        if (Tpa.onlinePlayerCount(server) <= 1) {
             return fail(player, server, "No other players online.");
         }
         List<TpaRequest> selected = select(Tpa.registry().outgoing(player.getUUID()), who, server, false);
@@ -205,7 +205,7 @@ public final class TpaCommands {
         for (TpaRequest request : selected) {
             if (Tpa.registry().remove(request.id) == null) continue;
             lastCounterpart = request.targetName;
-            Tpa.notify(server.getPlayerList().getPlayer(request.target),
+            Tpa.notify(Tpa.resolvePlayer(server, request.target),
                     ChatFormatting.RED + player.getGameProfile().getName() + " cancelled their teleport request.", tick);
             done++;
         }
@@ -243,7 +243,7 @@ public final class TpaCommands {
     }
 
     private static String nameOf(MinecraftServer server, UUID uuid) {
-        ServerPlayer player = server.getPlayerList().getPlayer(uuid);
+        ServerPlayer player = Tpa.resolvePlayer(server, uuid);
         return player == null ? "a player" : player.getGameProfile().getName();
     }
 

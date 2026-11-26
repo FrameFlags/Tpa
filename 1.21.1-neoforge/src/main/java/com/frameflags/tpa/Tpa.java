@@ -7,8 +7,10 @@ import com.frameflags.tpa.core.TpaRequest;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.ChatFormatting;
@@ -30,6 +32,9 @@ public final class Tpa {
     private static final RequestRegistry REGISTRY = new RequestRegistry();
     private static final Map<UUID, List<String>> CHAT = new ConcurrentHashMap<>();
     private static Path gameDir = Path.of(".");
+
+    /** Probe-only identities; deliberately outside all PlayerList collections. */
+    private static final Map<String, ServerPlayer> TEST_PLAYERS = new ConcurrentHashMap<>();
 
     private Tpa() {
     }
@@ -94,9 +99,9 @@ public final class Tpa {
     public static void onServerTick(MinecraftServer server, int tick) {
         if (server == null) return;
         for (TpaRequest request : REGISTRY.tick(tick)) {
-            ServerPlayer requester = server.getPlayerList().getPlayer(request.requester);
-            ServerPlayer target = server.getPlayerList().getPlayer(request.target);
-            String requesterName = requester == null ? "a player" : requester.getGameProfile().getName();
+            ServerPlayer requester = resolvePlayer(server, request.requester);
+            ServerPlayer target = resolvePlayer(server, request.target);
+            String requesterName = requester == null ? "a player" : profileName(requester);
             notify(requester, ChatFormatting.RED + "Your teleport request to " + request.targetName + " has expired.", tick);
             notify(target, ChatFormatting.RED + "Teleport request from " + requesterName + " has expired.", tick);
         }
@@ -113,15 +118,88 @@ public final class Tpa {
         CHAT.clear();
     }
 
-    /** Adapter-side player lookup by online name, case-insensitive fallback. */
+    /** Adapter-side player lookup. Probe-only identities are consulted first by name. */
     public static ServerPlayer resolveTarget(MinecraftServer server, String name) {
-        if (server == null || name == null || name.isEmpty()) return null;
+        if (name == null || name.isEmpty()) return null;
+        ServerPlayer testPlayer = testPlayerByName(name);
+        if (testPlayer != null) return testPlayer;
+        if (server == null) return null;
         ServerPlayer exact = server.getPlayerList().getPlayerByName(name);
         if (exact != null) return exact;
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             if (player.getGameProfile().getName().equalsIgnoreCase(name)) return player;
         }
         return null;
+    }
+
+    /**
+     * Probe-only registration. Fabricated players have no network connection and must
+     * never be inserted into any PlayerList collection: the vanilla tick would touch
+     * their null connection. They live only in this side map.
+     */
+    public static synchronized boolean registerTestPlayer(ServerPlayer player) {
+        if (player == null) return false;
+        String name = profileName(player);
+        if (name == null || name.isEmpty()) return false;
+        for (Map.Entry<String, ServerPlayer> entry : TEST_PLAYERS.entrySet()) {
+            if (entry.getKey().equalsIgnoreCase(name) && entry.getValue() != player) return false;
+        }
+        TEST_PLAYERS.put(name, player);
+        return true;
+    }
+
+    /** Probe-only cleanup of the side map; no PlayerList collection is touched. */
+    public static synchronized void unregisterTestPlayers() {
+        TEST_PLAYERS.clear();
+    }
+
+    /** Authlib profile name: getName() in this MC version, name() in newer ones. */
+    private static String profileName(ServerPlayer player) {
+        if (player == null) return null;
+        Object profile = player.getGameProfile();
+        if (profile == null) return null;
+        for (String accessor : new String[] { "getName", "name" }) {
+            try {
+                Object value = profile.getClass().getMethod(accessor).invoke(profile);
+                if (value instanceof String && !((String) value).isEmpty()) return (String) value;
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                // Try the other accessor name.
+            }
+        }
+        return null;
+    }
+
+    private static ServerPlayer testPlayerByName(String name) {
+        if (name == null || name.isEmpty()) return null;
+        ServerPlayer exact = TEST_PLAYERS.get(name);
+        if (exact != null) return exact;
+        for (Map.Entry<String, ServerPlayer> entry : TEST_PLAYERS.entrySet()) {
+            if (entry.getKey().equalsIgnoreCase(name)) return entry.getValue();
+        }
+        return null;
+    }
+
+    /** Resolves a probe-only player first, then a real online player, by UUID. */
+    public static ServerPlayer resolvePlayer(MinecraftServer server, UUID uuid) {
+        if (uuid == null) return null;
+        for (ServerPlayer player : TEST_PLAYERS.values()) {
+            if (uuid.equals(player.getUUID())) return player;
+        }
+        return server == null ? null : server.getPlayerList().getPlayer(uuid);
+    }
+
+    /** Unique online count: real players plus probe-only players (empty in normal play). */
+    public static int onlinePlayerCount(MinecraftServer server) {
+        Set<UUID> ids = new HashSet<>();
+        if (server != null) {
+            for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                if (player != null) ids.add(player.getUUID());
+            }
+        }
+        for (ServerPlayer player : TEST_PLAYERS.values()) {
+            if (player != null) ids.add(player.getUUID());
+        }
+        return ids.size();
     }
 
     /** Captures the exact current position and facing of a player. */

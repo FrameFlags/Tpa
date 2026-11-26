@@ -71,7 +71,7 @@ public final class TpaCommands {
         }
         MinecraftServer server = source.getServer();
         String name = StringArgumentType.getString(context, "player");
-        if (server == null || server.getPlayerList().getPlayers().size() <= 1) {
+        if (server == null || !Tpa.hasOtherPlayers(requester, server)) {
             Tpa.message(source, requester, ChatFormatting.RED + "No other players online.", false);
             return 0;
         }
@@ -144,7 +144,7 @@ public final class TpaCommands {
                 Tpa.tell(server, other, ChatFormatting.RED + actor.getGameProfile().name()
                         + " denied your teleport request.", tick);
             } else if (request.isHere()) {
-                ServerPlayer guest = server.getPlayerList().getPlayer(request.target);
+                ServerPlayer guest = Tpa.findPlayer(server, request.target);
                 if (guest != null && request.snapshot != null) {
                     Tpa.teleport(guest, request.snapshot, server);
                     affected++;
@@ -154,8 +154,8 @@ public final class TpaCommands {
                     Tpa.tell(server, other, ChatFormatting.RED + "The requester is no longer online.", tick);
                 }
             } else {
-                ServerPlayer requester = server.getPlayerList().getPlayer(request.requester);
-                ServerPlayer target = server.getPlayerList().getPlayer(request.target);
+                ServerPlayer requester = Tpa.findPlayer(server, request.requester);
+                ServerPlayer target = Tpa.findPlayer(server, request.target);
                 if (requester != null && target != null) {
                     // /tpa uses the target's live pose at accept time.
                     Tpa.teleport(requester, pose(target), server);

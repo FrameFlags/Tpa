@@ -13,6 +13,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerPlayerEntity;
 
 /**
  * Static product API shared by the command adapter, the tick handler and the
@@ -26,6 +28,8 @@ public final class Tpa {
     private static final Map<UUID, List<String>> CHAT = new ConcurrentHashMap<UUID, List<String>>();
     private static final RequestRegistry REGISTRY = new RequestRegistry();
     private static final AtomicLong TICK = new AtomicLong();
+    /** Probe-only virtual players: not in the PlayerList, but visible to command lookup. */
+    private static final List<ServerPlayerEntity> TEST_PLAYERS = new ArrayList<ServerPlayerEntity>();
 
     private static TpaConfig config = new TpaConfig();
     private static Path gameDir = Paths.get(".");
@@ -100,6 +104,44 @@ public final class Tpa {
         recentMessages.clear();
     }
 
+    /** Registers a fabricated probe player so resolveTarget can find it. Probe-only hook. */
+    public static synchronized void registerTestPlayer(ServerPlayerEntity player) {
+        if (player != null && !TEST_PLAYERS.contains(player)) TEST_PLAYERS.add(player);
+    }
+
+    public static synchronized void unregisterTestPlayers() {
+        TEST_PLAYERS.clear();
+    }
+
+    /** Adapter-side player lookup: online players first, then probe-only virtual players. */
+    public static ServerPlayerEntity resolveTarget(MinecraftServer server, String name) {
+        if (server == null || name == null) return null;
+        String needle = name.trim();
+        if (needle.isEmpty()) return null;
+        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+            if (player != null && needle.equalsIgnoreCase(player.getName().getString())) return player;
+        }
+        synchronized (TEST_PLAYERS) {
+            for (ServerPlayerEntity player : TEST_PLAYERS) {
+                if (needle.equalsIgnoreCase(player.getName().getString())) return player;
+            }
+        }
+        return null;
+    }
+
+    /** Finds a player by UUID in either the PlayerList or the probe-only virtual list. */
+    public static ServerPlayerEntity findPlayer(MinecraftServer server, UUID id) {
+        if (server == null || id == null) return null;
+        ServerPlayerEntity player = server.getPlayerManager().getPlayer(id);
+        if (player != null) return player;
+        synchronized (TEST_PLAYERS) {
+            for (ServerPlayerEntity candidate : TEST_PLAYERS) {
+                if (id.equals(candidate.getUuid())) return candidate;
+            }
+        }
+        return null;
+    }
+
     /** Removes every request involving a player (disconnect/death). */
     public static void purge(UUID player) {
         REGISTRY.purge(player);
@@ -111,5 +153,6 @@ public final class Tpa {
         REGISTRY.clear();
         CHAT.clear();
         recentMessages.clear();
+        unregisterTestPlayers();
     }
 }

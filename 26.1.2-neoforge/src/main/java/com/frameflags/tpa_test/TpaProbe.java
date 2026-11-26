@@ -1,13 +1,11 @@
 package com.frameflags.tpa_test;
 
 import com.mojang.authlib.GameProfile;
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import net.minecraft.network.chat.Component;
@@ -15,14 +13,14 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.server.players.PlayerList;
 import net.minecraft.world.entity.Relative;
 import net.minecraft.world.phys.Vec3;
 
 /**
  * In-game behavior probe. All state changes go through the real command dispatcher as either the
  * joined player or a fabricated server player. Product state is inspected reflectively so the
- * probe still loads when the product jar is absent.
+ * probe still loads when the product jar is absent. Fabricated players are registered through the
+ * product's probe-only hook and are never inserted into PlayerList (they have no connection).
  */
 public final class TpaProbe {
     private static final double TOL = 0.01D;
@@ -97,7 +95,7 @@ public final class TpaProbe {
             MinecraftServer server = player.level().getServer();
             for (int i = 0; i < 6; i++) {
                 FakePlayer bot = new FakePlayer(server, level, "TpaBot" + i);
-                register(bot, server);
+                registerBot(bot, server);
                 BOTS.add(bot);
             }
             clear(user);
@@ -424,33 +422,18 @@ public final class TpaProbe {
                 && Math.abs(a.yaw - b.yaw) <= TOL && Math.abs(a.pitch - b.pitch) <= TOL;
     }
 
-    @SuppressWarnings("unchecked")
-    private static void register(FakePlayer fake, MinecraftServer server) throws Exception {
-        PlayerList list = server.getPlayerList();
-        Field players = PlayerList.class.getDeclaredField("players");
-        players.setAccessible(true);
-        List<ServerPlayer> all = (List<ServerPlayer>) players.get(list);
-        if (!all.contains(fake)) all.add(fake);
-        Field byUuid = PlayerList.class.getDeclaredField("playersByUUID");
-        byUuid.setAccessible(true);
-        Map<UUID, ServerPlayer> map = (Map<UUID, ServerPlayer>) byUuid.get(list);
-        map.put(fake.getUUID(), fake);
+    /** Registers a fabricated player via the product hook; never writes into PlayerList. */
+    private static void registerBot(FakePlayer fake, MinecraftServer server) throws Exception {
+        call("registerTestPlayer", new Class<?>[] { ServerPlayer.class }, fake);
+        Object found = call("findPlayer", new Class<?>[] { MinecraftServer.class, UUID.class },
+                server, fake.getUUID());
+        if (found != fake) throw new IllegalStateException("test player hook did not register " + fake.getUUID());
     }
 
     private static void cleanup() {
         if (BOTS.isEmpty()) return;
         try {
-            PlayerList list = BOTS.get(0).level().getServer().getPlayerList();
-            Field players = PlayerList.class.getDeclaredField("players");
-            players.setAccessible(true);
-            List<ServerPlayer> all = (List<ServerPlayer>) players.get(list);
-            Field byUuid = PlayerList.class.getDeclaredField("playersByUUID");
-            byUuid.setAccessible(true);
-            Map<UUID, ServerPlayer> map = (Map<UUID, ServerPlayer>) byUuid.get(list);
-            for (FakePlayer fake : BOTS) {
-                all.remove(fake);
-                map.remove(fake.getUUID());
-            }
+            call("unregisterTestPlayers", new Class<?>[0]);
         } catch (Throwable ignored) {
             // Best-effort cleanup; verdict is already decided.
         }
