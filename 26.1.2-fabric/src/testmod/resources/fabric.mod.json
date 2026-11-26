@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "tpa_test",
+  "version": "1.0.0",
+  "name": "Tpa behavior probe (test only)",
+  "description": "In-game test harness; never shipped in the product jar.",
+  "authors": ["FrameFlags tests"],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": { "main": ["com.frameflags.tpa_test.TpaProbeFabricMod"] },
+  "depends": { "fabricloader": "*", "minecraft": "*", "fabric-api": "*" }
+}

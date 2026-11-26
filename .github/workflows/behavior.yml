@@ -1,0 +1,98 @@
+name: Tpa in-game behavior test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  behavior:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cell: 1.12.2-forge,    mc: '1.12.2',  loader: forge,    mrt: forge,    java: '8',  api: none,                  gradle: '4.9', mode: green }
+          - { cell: 1.16.5-forge,    mc: '1.16.5',  loader: forge,    mrt: forge,    java: '16', runtime-java: '8', api: none,                  gradle: '7.2', mode: green }
+          - { cell: 1.16.5-fabric,   mc: '1.16.5',  loader: fabric,   mrt: fabric,   java: '16', runtime-java: '8', api: none,       gradle: '7.2', mode: green }
+          - { cell: 1.19.2-forge,    mc: '1.19.2',  loader: forge,    mrt: forge,    java: '17', api: none,                  gradle: '8.1.1', mode: green }
+          - { cell: 1.20.1-forge,    mc: '1.20.1',  loader: forge,    mrt: forge,    java: '17', api: none,                  gradle: '8.14.3', mode: green }
+          - { cell: 1.20.1-fabric,   mc: '1.20.1',  loader: fabric,   mrt: fabric,   java: '21', api: '0.92.11',     gradle: '9.5.0', mode: green, config: countdown }
+          - { cell: 1.21.1-fabric,   mc: '1.21.1',  loader: fabric,   mrt: fabric,   java: '21', api: '0.107.0',     gradle: '9.5.0', mode: green }
+          - { cell: 1.21.1-neoforge, mc: '1.21.1',  loader: neoforge, mrt: neoforge, java: '21', api: none,                  gradle: '9.2.1', mode: green }
+          - { cell: 26.1.2-fabric,   mc: '26.1.2',  loader: fabric,   mrt: fabric,   java: '25', api: '0.154.0',     gradle: '9.8.2', mode: green }
+          - { cell: 26.1.2-neoforge, mc: '26.1.2',  loader: neoforge, mrt: neoforge, java: '25', api: none,                  gradle: '9.2.1', mode: green }
+          - { cell: 26.3-fabric,     mc: '26.3',    loader: fabric,   mrt: fabric,   java: '25', api: '0.165.0',       gradle: '9.8.2', mode: green }
+          - { cell: 26.3-neoforge,   mc: '26.3',    loader: neoforge, mrt: neoforge, java: '25', api: none,                  gradle: '9.2.1', mode: green }
+          - { cell: 1.12.2-forge,    mc: '1.12.2',  loader: forge,    mrt: forge,    java: '8',  api: none,                  gradle: '4.9', mode: negative }
+          - { cell: 1.16.5-fabric,   mc: '1.16.5',  loader: fabric,   mrt: fabric,   java: '16', runtime-java: '8', api: none,       gradle: '7.2', mode: negative }
+          - { cell: 1.20.1-forge,    mc: '1.20.1',  loader: forge,    mrt: forge,    java: '17', api: none,                  gradle: '8.14.3', mode: negative }
+          - { cell: 26.3-neoforge,   mc: '26.3',    loader: neoforge, mrt: neoforge, java: '25', api: none,                  gradle: '9.2.1', mode: negative }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, 'java-version': '${{ matrix.java }}' }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { 'gradle-version': '${{ matrix.gradle }}' }
+      - name: Build cell
+        working-directory: ${{ matrix.cell }}
+        run: gradle build --no-daemon -x test
+      - name: Stage probe and product
+        run: |
+          mkdir -p run/mods run/config
+          cp "${{ matrix.cell }}/build/libs/tpa-testmod-${{ matrix.cell }}-1.0.0.jar" run/mods/
+          if [ "${{ matrix.mode }}" = "green" ]; then
+            cp "${{ matrix.cell }}/build/libs/tpa-${{ matrix.cell }}-1.0.0.jar" run/mods/
+          fi
+          printf '{\n  "expirySeconds": 2,\n  "maxOutgoing": 5\n}\n' > run/config/tpa.json
+      - name: Stage Fabric API 0.42.0 for 1.16.5
+        if: matrix.cell == '1.16.5-fabric'
+        run: curl -fL --retry 3 -o 'run/mods/fabric-api-0.42.0+1.16.jar' 'https://github.com/FabricMC/fabric-api/releases/download/0.42.0%2B1.16/fabric-api-0.42.0+1.16.jar'
+      - name: Select Java 8 runtime for legacy launcher
+        if: matrix.runtime-java != ''
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, 'java-version': '${{ matrix.runtime-java }}' }
+      - name: Launch Minecraft ${{ matrix.mc }} (${{ matrix.loader }}) with in-game probe
+        continue-on-error: true
+        uses: headlesshq/mc-runtime-test@5.0.0
+        with:
+          mc: ${{ matrix.mc }}
+          modloader: ${{ matrix.loader }}
+          'mc-runtime-test': ${{ matrix.mrt }}
+          java: ${{ matrix.runtime-java || matrix.java }}
+          'fabric-api': ${{ matrix.api }}
+          xvfb: 'true'
+          'headlessmc-command': '--jvm "-DMcRuntimeGameTest=false"'
+      - name: Assert behavior marker
+        run: |
+          cat $(find . -name latest.log -print 2>/dev/null) > tpa.log 2>/dev/null || true
+          cat tpa-result.txt run/tpa-result.txt 2>/dev/null >> tpa.log || true
+          echo "=== behavior marker ==="
+          grep 'TPA_TEST_RESULT:' tpa.log || true
+          test "$(grep -h '^TPA_TEST_RESULT:' tpa-result.txt run/tpa-result.txt 2>/dev/null | sort -u | wc -l)" -eq 1
+          if [ "${{ matrix.mode }}" = "green" ]; then
+            grep -q 'TPA_TEST_RESULT: PASS' tpa.log
+            grep -q 'product=true' tpa.log
+            grep -q 'request_ok' tpa.log
+            grep -q 'accept_ok' tpa.log
+            grep -q 'deny_ok' tpa.log
+            grep -q 'cancel_ok' tpa.log
+            grep -q 'expiry_ok' tpa.log
+            grep -q 'tpahere_ok' tpa.log
+            grep -q 'no_spam' tpa.log
+          else
+            grep -q 'TPA_TEST_RESULT: FAIL' tpa.log
+            grep -q 'product=false' tpa.log
+            grep -q 'reason=no_product' tpa.log
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: behavior-${{ matrix.cell }}-${{ matrix.mode }}
+          path: |
+            tpa-result.txt
+            run/tpa-result.txt
+            tpa.log
+            run/logs/latest.log

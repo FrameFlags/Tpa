@@ -1,0 +1,35 @@
+plugins { id 'fabric-loom' version "${loom_version}" }
+version = project.mod_version
+group = project.maven_group
+base { archivesName = "tpa-1.20.1-fabric" }
+repositories { }
+loom { mods { "tpa" { sourceSet sourceSets.main } } }
+dependencies {
+ minecraft "com.mojang:minecraft:${project.minecraft_version}"
+ mappings loom.officialMojangMappings()
+ modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+ modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+ testImplementation "org.junit.jupiter:junit-jupiter:5.10.3"
+ testRuntimeOnly "org.junit.platform:junit-platform-launcher:1.10.3"
+}
+processResources { inputs.property "version", version; filesMatching("fabric.mod.json") { expand "version": version } }
+tasks.withType(JavaCompile).configureEach { options.release = 17 }
+java { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+test { useJUnitPlatform(); testLogging { events "passed", "failed", "skipped" } }
+
+// Product jar never ships the in-game probe.
+tasks.named('jar') { exclude 'com/frameflags/tpa_test/**' }
+
+// Test-only probe jar: probe classes + probe metadata, remapped named -> intermediary.
+tasks.register('testmodJar', Jar) {
+ archiveBaseName = "tpa-testmod-unremapped-1.20.1-fabric"
+ from(sourceSets.main.output.classesDirs) { include 'com/frameflags/tpa_test/**' }
+ from('src/testmod/resources')
+}
+tasks.register('remapTestmodJar', net.fabricmc.loom.task.RemapJarTask) {
+ dependsOn testmodJar
+ inputFile = testmodJar.archiveFile
+ archiveFileName = "tpa-testmod-1.20.1-fabric-1.0.0.jar"
+ destinationDirectory = layout.buildDirectory.dir("libs")
+}
+build.dependsOn remapTestmodJar

@@ -1,0 +1,27 @@
+modLoader="javafml"
+loaderVersion="[1,)"
+license="MIT"
+displayTest="IGNORE_SERVER_VERSION"
+
+[[mods]]
+modId="tpa_test"
+version="1.0.0"
+displayName="Tpa behavior probe (test only)"
+authors="FrameFlags"
+description="""
+In-game test harness; never shipped in the product jar.
+"""
+
+[[dependencies.tpa_test]]
+modId="neoforge"
+mandatory=true
+versionRange="[1,)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.tpa_test]]
+modId="minecraft"
+mandatory=true
+versionRange="[1,)"
+ordering="NONE"
+side="BOTH"

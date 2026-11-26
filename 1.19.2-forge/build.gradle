@@ -1,0 +1,146 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '6.0.54'
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    archivesName = "${mod_id}-1.19.2-forge"
+}
+
+// CI runs a JDK 17 here. Locally only a JDK 21 is available, so use plain
+// source/target compatibility (bytecode 17) instead of a java.toolchain,
+// which would also require the Foojay resolver plugin.
+sourceCompatibility = JavaVersion.VERSION_17
+targetCompatibility = JavaVersion.VERSION_17
+
+println "Java: ${System.getProperty 'java.version'}, JVM: ${System.getProperty 'java.vm.version'} (${System.getProperty 'java.vendor'}), Arch: ${System.getProperty 'os.arch'}"
+
+// The test-only probe is a second mod in its own jar. It compiles against the
+// product classes and the Minecraft/Forge classpath, but is never shipped as
+// part of the product jar.
+sourceSets {
+    testmod {
+        java.srcDir 'src/testmod/java'
+        resources.srcDir 'src/testmod/resources'
+        compileClasspath += sourceSets.main.output + configurations.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
+}
+
+minecraft {
+    mappings channel: 'official', version: '1.19.2'
+    copyIdeResources = true
+
+    runs {
+        configureEach {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            property 'forge.enabledGameTestNamespaces', mod_id
+
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                    source sourceSets.testmod
+                }
+            }
+        }
+
+        client {}
+
+        server {
+            args '--nogui'
+        }
+
+        gameTestServer {}
+
+        data {
+            workingDirectory project.file('run-data')
+            args '--mod', mod_id, '--all', '--output', file('src/generated/resources/'), '--existing', file('src/main/resources/')
+        }
+    }
+}
+
+sourceSets.main.resources { srcDir 'src/generated/resources' }
+
+repositories {
+    // ForgeGradle adds the Forge maven and Maven Central automatically.
+}
+
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.19.2-43.3.5'
+}
+
+// The probe ships its own META-INF/mods.toml; ForgeGradle also contributes a
+// copy to every ProcessResources task, so keep the first (testmod) one.
+tasks.named('processTestmodResources', ProcessResources).configure {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+            minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
+            forge_version: forge_version, forge_version_range: forge_version_range,
+            loader_version_range: loader_version_range,
+            mod_id: mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
+            mod_authors: mod_authors, mod_description: mod_description,
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties + [project: project]
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    manifest {
+        attributes([
+                'Specification-Title'     : mod_id,
+                'Specification-Vendor'    : mod_authors,
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.jar.archiveVersion,
+                'Implementation-Vendor'   : mod_authors,
+                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+    finalizedBy 'reobfJar'
+}
+
+tasks.register('testmodJar', Jar) {
+    group = 'build'
+    description = 'Packages the Tpa in-game probe as a separate test mod jar'
+    archiveFileName = 'tpa-testmod-1.19.2-forge-1.0.0.jar'
+    from sourceSets.testmod.output
+    manifest {
+        attributes([
+                'Specification-Title'     : testmod_id,
+                'Specification-Vendor'    : mod_authors,
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : 'tpa-testmod-1.19.2-forge',
+                'Implementation-Version'  : mod_version,
+                'Implementation-Vendor'   : mod_authors,
+                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+    finalizedBy 'reobfTestmodJar'
+}
+
+// ForgeGradle 6 creates the reobfTestmodJar task from this registration.
+reobf {
+    testmodJar {}
+}
+
+tasks.named('assemble').configure {
+    dependsOn 'testmodJar'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}

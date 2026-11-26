@@ -1,0 +1,27 @@
+modLoader="javafml"
+loaderVersion="[1,)"
+license="MIT"
+displayTest="IGNORE_SERVER_VERSION"
+
+[[mods]]
+modId="tpa"
+version="1.0.0"
+displayName="Tpa"
+authors="FrameFlags"
+description="""
+Teleport requests: /tpa, /tpahere, /tpaccept, /tpdeny, /tpacancel. No op required.
+"""
+
+[[dependencies.tpa]]
+modId="neoforge"
+mandatory=true
+versionRange="[1,)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.tpa]]
+modId="minecraft"
+mandatory=true
+versionRange="[1,)"
+ordering="NONE"
+side="BOTH"

@@ -1,0 +1,24 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="tpa"
+version="1.0.0"
+displayName="Tpa"
+authors="FrameFlags"
+description='''EssentialsX-style teleport requests: /tpa, /tpahere, /tpaccept, /tpdeny, /tpacancel. No op or permissions plugin required.'''
+
+[[dependencies.tpa]]
+    modId="forge"
+    mandatory=true
+    versionRange="[47,)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.tpa]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.20.1,1.21)"
+    ordering="NONE"
+    side="BOTH"

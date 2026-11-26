@@ -1,0 +1,88 @@
+buildscript {
+    repositories {
+        maven { url = 'https://maven.minecraftforge.net/' }
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'net.minecraftforge.gradle:ForgeGradle:2.3-SNAPSHOT'
+    }
+}
+
+apply plugin: 'java'
+apply plugin: 'net.minecraftforge.gradle.forge'
+
+version = project.mod_version
+group = project.mod_group_id
+archivesBaseName = 'tpa-1.12.2-forge'
+
+sourceCompatibility = targetCompatibility = '1.8'
+compileJava {
+    sourceCompatibility = targetCompatibility = '1.8'
+    options.encoding = 'UTF-8'
+}
+
+minecraft {
+    version = "${project.minecraft_version}-${project.forge_version}"
+    runDir = 'run'
+    mappings = project.mcp_version
+    makeObfSourceJar = false
+}
+
+repositories {
+    mavenCentral()
+}
+
+// The in-game probe is compiled from its own source set so it can load with the
+// product jar absent (negative control). It talks to the product via reflection.
+sourceSets {
+    testmod {
+        java.srcDir 'src/testmod/java'
+        resources.srcDir 'src/testmod/resources'
+        compileClasspath += sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.runtimeClasspath
+    }
+}
+
+compileTestmodJava {
+    sourceCompatibility = targetCompatibility = '1.8'
+    options.encoding = 'UTF-8'
+}
+
+processResources {
+    inputs.property 'version', project.version
+    inputs.property 'mcversion', project.minecraft_version
+
+    from(sourceSets.main.resources.srcDirs) {
+        include 'mcmod.info', 'pack.mcmeta'
+        expand 'version': project.version, 'mcversion': project.minecraft_version
+    }
+    from(sourceSets.main.resources.srcDirs) {
+        exclude 'mcmod.info', 'pack.mcmeta'
+    }
+}
+
+// Product jar contains no probe classes (keepinventory_test style exclusion).
+jar {
+    exclude 'com/frameflags/tpa_test/**'
+}
+
+task testmodJar(type: Jar, dependsOn: sourceSets.testmod.output) {
+    archiveName = "tpa-testmod-1.12.2-forge-${project.mod_version}.jar"
+    from sourceSets.testmod.output
+}
+
+// Dedicated Forge servers load SRG names; reobfuscate the probe jar as well.
+reobf {
+    testmodJar {
+        mappingType = 'SEARGE'
+    }
+}
+
+build.dependsOn testmodJar
+
+// The dedicated-server CI never needs vanilla client assets.
+tasks.whenTaskAdded { task ->
+    if (task.name == 'getAssets') {
+        task.enabled = false
+    }
+}

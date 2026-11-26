@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "tpa",
+  "version": "${version}",
+  "name": "Tpa",
+  "description": "Teleport requests: /tpa, /tpahere, /tpaccept, /tpdeny, /tpacancel. No op required.",
+  "authors": ["FrameFlags"],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": { "main": ["com.frameflags.tpa.TpaFabricMod"] },
+  "depends": { "fabricloader": ">=0.19.3", "minecraft": "~26.1.2", "java": ">=25", "fabric-api": "*" }
+}

@@ -1,0 +1,14 @@
+[{
+  "modid": "tpa",
+  "name": "Tpa",
+  "description": "EssentialsX-style teleport requests: /tpa, /tpahere, /tpaccept, /tpdeny, /tpacancel. No op, no cheats, no permission plugin.",
+  "version": "${version}",
+  "mcversion": "${mcversion}",
+  "url": "",
+  "updateUrl": "",
+  "authorList": ["FrameFlags"],
+  "credits": "Shared TPA core.",
+  "logoFile": "",
+  "screenshots": [],
+  "dependencies": []
+}]

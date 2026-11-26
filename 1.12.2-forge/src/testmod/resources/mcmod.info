@@ -1,0 +1,14 @@
+[{
+  "modid": "tpa_test",
+  "name": "Tpa in-game probe (test only)",
+  "description": "Server-side test harness: dispatches real Tpa commands and writes one machine-readable result line. Never shipped in the product jar.",
+  "version": "1.0.0",
+  "mcversion": "1.12.2",
+  "url": "",
+  "updateUrl": "",
+  "authorList": ["FrameFlags tests"],
+  "credits": "Test-only probe; no product behavior.",
+  "logoFile": "",
+  "screenshots": [],
+  "dependencies": []
+}]

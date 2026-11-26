@@ -1,0 +1,28 @@
+# Test-only in-game probe for Tpa. Loads in a separate jar and drives the
+# real command dispatcher as a joined player. It deliberately does NOT declare
+# a dependency on "tpa" so a negative control (product jar removed) can
+# still load the probe and report a FAIL result.
+modLoader="javafml"
+loaderVersion="[43,)"
+license="MIT"
+
+[[mods]]
+modId="tpa_test"
+version="1.0.0"
+displayName="Tpa Test Probe"
+authors="FrameFlags"
+description='''In-game probe that verifies Tpa commands and writes tpa-result.txt.'''
+
+[[dependencies.tpa_test]]
+modId="forge"
+mandatory=true
+versionRange="[43,)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.tpa_test]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.19.2,1.20)"
+ordering="NONE"
+side="BOTH"

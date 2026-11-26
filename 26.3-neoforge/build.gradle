@@ -1,0 +1,48 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'net.neoforged.moddev' version '2.0.148'
+}
+
+version = mod_version
+group = mod_group_id
+base { archivesName = "tpa-26.3-neoforge" }
+repositories { }
+java.toolchain.languageVersion = JavaLanguageVersion.of(25)
+
+neoForge {
+    version = neo_version
+    mods {
+        "${mod_id}" { sourceSet sourceSets.main }
+    }
+}
+
+configurations { runtimeClasspath.extendsFrom localRuntime }
+
+dependencies {
+    testImplementation "org.junit.jupiter:junit-jupiter:5.10.3"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher:1.10.3"
+}
+
+test { useJUnitPlatform(); testLogging { events "passed", "failed", "skipped" } }
+
+tasks.withType(ProcessResources).configureEach {
+    var replaceProperties = [
+            minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
+            neo_version: neo_version, loader_version_range: loader_version_range,
+            mod_id: mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
+            mod_group_id: mod_group_id, mod_authors: mod_authors, mod_description: mod_description,
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/neoforge.mods.toml']) { expand replaceProperties }
+}
+
+// Product jar never ships the in-game probe.
+tasks.named('jar') { exclude 'com/frameflags/tpa_test/**' }
+
+tasks.register('testmodJar', Jar) {
+    archiveFileName = "tpa-testmod-26.3-neoforge-1.0.0.jar"
+    from(sourceSets.main.output.classesDirs) { include 'com/frameflags/tpa_test/**' }
+    from('src/testmod/resources')
+}
+build.dependsOn testmodJar

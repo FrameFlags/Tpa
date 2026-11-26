@@ -1,0 +1,132 @@
+buildscript {
+    repositories {
+        maven { url = 'https://maven.minecraftforge.net' }
+        mavenCentral()
+    }
+    dependencies {
+        classpath group: 'net.minecraftforge.gradle', name: 'ForgeGradle', version: '5.1.77', changing: false
+    }
+}
+apply plugin: 'net.minecraftforge.gradle'
+apply plugin: 'eclipse'
+apply plugin: 'maven-publish'
+
+version = '1.0.0'
+group = 'com.frameflags.tpa'
+archivesBaseName = 'tpa-1.16.5-forge'
+
+// Running JVM may be 8/21; emitted bytecode is always Java 8.
+// Deliberately no java.toolchain (avoids Foojay downloads on CI).
+sourceCompatibility = '1.8'
+targetCompatibility = '1.8'
+
+println('Java: ' + System.getProperty('java.version') + ' JVM: ' + System.getProperty('java.vm.version') + '(' + System.getProperty('java.vendor') + ') Arch: ' + System.getProperty('os.arch'))
+
+// Declared before `minecraft` so the run configs below can reference testmod.
+sourceSets {
+    testmod {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+configurations {
+    testmodImplementation.extendsFrom implementation
+}
+
+minecraft {
+    mappings channel: 'official', version: '1.16.5'
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods {
+                tpa { source sourceSets.main }
+                tpa_test { source sourceSets.testmod }
+            }
+        }
+        server {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods {
+                tpa { source sourceSets.main }
+                tpa_test { source sourceSets.testmod }
+            }
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.16.5-36.2.40'
+    // Gson is shipped by Minecraft at runtime but is not on FG5.1's compile classpath.
+    compileOnly 'com.google.code.gson:gson:2.8.0'
+    testmodCompileOnly 'com.google.code.gson:gson:2.8.0'
+}
+
+// -- Product jar -----------------------------------------------------------
+jar {
+    archiveBaseName = 'tpa-1.16.5-forge'
+    archiveVersion = '1.0.0'
+    manifest {
+        attributes([
+            'Specification-Title'     : 'tpa',
+            'Specification-Vendor'    : 'frameflags',
+            'Specification-Version'   : '1',
+            'Implementation-Title'    : project.name,
+            'Implementation-Version'  : '1.0.0',
+            'Implementation-Vendor'   : 'frameflags',
+            'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+    finalizedBy 'reobfJar'
+}
+
+// -- Separate test-only probe jar -----------------------------------------
+task testmodJar(type: Jar) {
+    dependsOn classes, testmodClasses
+    archiveBaseName = 'tpa-testmod-1.16.5-forge'
+    archiveVersion = '1.0.0'
+    from sourceSets.testmod.output
+    manifest {
+        attributes([
+            'Specification-Title'     : 'tpa_test',
+            'Specification-Vendor'    : 'frameflags',
+            'Specification-Version'   : '1',
+            'Implementation-Title'    : 'tpa-testmod',
+            'Implementation-Version'  : '1.0.0',
+            'Implementation-Vendor'   : 'frameflags',
+            'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+}
+
+// FG5.1 'reobf' extension creates reobfTestmodJar, wires its mappings/input
+// and adds it to assemble (and therefore to build).
+reobf {
+    testmodJar { }
+}
+
+build.dependsOn testmodJar
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            artifact jar
+        }
+    }
+    repositories {
+        maven {
+            url "file:///${project.projectDir}/mcmodsrepo"
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

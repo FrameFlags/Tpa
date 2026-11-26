@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "tpa",
+  "version": "${version}",
+  "name": "Tpa",
+  "description": "EssentialsX-style teleport requests: /tpa, /tpahere, /tpaccept, /tpdeny, /tpacancel. No op, no permission plugin.",
+  "authors": ["frameflags"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.frameflags.tpa.TpaMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.11.6",
+    "fabric": "*",
+    "minecraft": "1.16.5"
+  }
+}

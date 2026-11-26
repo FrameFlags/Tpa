@@ -1,0 +1,57 @@
+name: Tpa build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shared-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, 'java-version': '21' }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { 'gradle-version': '9.5.0' }
+      - name: Pure Java core tests
+        working-directory: shared-tests
+        run: gradle test --no-daemon
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cell: 1.12.2-forge,     java: '8',  gradle: '4.9',     jar: tpa-1.12.2-forge-1.0.0.jar }
+          - { cell: 1.16.5-forge,     java: '16', gradle: '7.2',     jar: tpa-1.16.5-forge-1.0.0.jar }
+          - { cell: 1.16.5-fabric,    java: '16', gradle: '7.2',     jar: tpa-1.16.5-fabric-1.0.0.jar }
+          - { cell: 1.19.2-forge,     java: '17', gradle: '8.1.1',   jar: tpa-1.19.2-forge-1.0.0.jar }
+          - { cell: 1.20.1-forge,     java: '17', gradle: '8.14.3',  jar: tpa-1.20.1-forge-1.0.0.jar }
+          - { cell: 1.20.1-fabric,    java: '17', gradle: '9.5.0',   jar: tpa-1.20.1-fabric-1.0.0.jar }
+          - { cell: 1.21.1-fabric,    java: '21', gradle: '9.5.0',   jar: tpa-1.21.1-fabric-1.0.0.jar }
+          - { cell: 1.21.1-neoforge,  java: '21', gradle: '9.2.1',   jar: tpa-1.21.1-neoforge-1.0.0.jar }
+          - { cell: 26.1.2-fabric,    java: '25', gradle: '9.8.2',   jar: tpa-26.1.2-fabric-1.0.0.jar }
+          - { cell: 26.1.2-neoforge,  java: '25', gradle: '9.2.1',   jar: tpa-26.1.2-neoforge-1.0.0.jar }
+          - { cell: 26.3-fabric,      java: '25', gradle: '9.8.2',   jar: tpa-26.3-fabric-1.0.0.jar }
+          - { cell: 26.3-neoforge,    java: '25', gradle: '9.2.1',   jar: tpa-26.3-neoforge-1.0.0.jar }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, 'java-version': '${{ matrix.java }}' }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { 'gradle-version': '${{ matrix.gradle }}' }
+      - name: Build ${{ matrix.cell }}
+        working-directory: ${{ matrix.cell }}
+        run: gradle build --no-daemon
+      - name: Assert jars
+        working-directory: ${{ matrix.cell }}
+        run: |
+          test -f "build/libs/${{ matrix.jar }}"
+          test -f "build/libs/tpa-testmod-${{ matrix.cell }}-1.0.0.jar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jars-${{ matrix.cell }}
+          path: ${{ matrix.cell }}/build/libs/*.jar

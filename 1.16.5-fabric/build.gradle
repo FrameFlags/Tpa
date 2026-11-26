@@ -1,0 +1,81 @@
+plugins {
+    id 'fabric-loom' version "${loom_version}"
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = "tpa-1.16.5-fabric"
+}
+
+repositories {
+    // Loom supplies the Minecraft, Mojang and Fabric repositories automatically.
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+// The in-game probe lives in its own source set so it can be shipped as a
+// separate mod jar. It is compiled against the product classes and the same
+// named (yarn-mapped) Minecraft classpath as the main source set.
+sourceSets {
+    testmod {
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+    }
+}
+
+configurations {
+    testmodImplementation.extendsFrom implementation
+    testmodRuntimeOnly.extendsFrom runtimeOnly
+}
+
+tasks.withType(JavaCompile).configureEach {
+    // Minecraft 1.16.5 is Java 8 bytecode. Gradle runs on JDK 17 locally and
+    // JDK 16 in CI, but --release 8 keeps every class file at major version 52.
+    options.release = 8
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+// Product jar never contains the probe.
+tasks.named('jar') {
+    exclude 'com/frameflags/tpa_test/**'
+}
+
+// Raw probe jar, still using yarn (named) references.
+tasks.register('testmodJar', Jar) {
+    group = 'build'
+    description = 'Builds the unremapped in-game probe mod jar.'
+    archiveBaseName = 'tpa-testmod-unremapped-1.16.5-fabric'
+    from sourceSets.testmod.output
+}
+
+// Loom 0.10.66 exposes RemapJarTask#getInput() (property name: input), not
+// the newer inputFile property. Remap named -> intermediary for the probe too.
+tasks.register('remapTestmodJar', net.fabricmc.loom.task.RemapJarTask) {
+    group = 'build'
+    description = 'Remaps the probe jar from yarn names to intermediary names.'
+    dependsOn testmodJar
+    input.set(testmodJar.archiveFile)
+    archiveFileName = 'tpa-testmod-1.16.5-fabric-1.0.0.jar'
+    destinationDirectory = layout.buildDirectory.dir('libs')
+}
+
+build.dependsOn remapTestmodJar

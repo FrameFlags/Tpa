@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "tpa_test",
+  "version": "1.0.0",
+  "name": "Tpa in-game probe",
+  "description": "Test-only probe that drives the real Tpa commands and writes tpa-result.txt.",
+  "authors": ["frameflags"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.frameflags.tpa_test.TpaTestMod"]
+  }
+}
